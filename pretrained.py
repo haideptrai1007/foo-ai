@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -30,6 +29,30 @@ from command_classifier.config import (
 from command_classifier.model.classifier import build_model
 from command_classifier.preprocessing.audio import normalize_waveform, pad_or_truncate
 from command_classifier.preprocessing.mel import create_mel_transform, mel_to_image, waveform_to_mel
+
+
+def _cleanup_speechcommands_partials(root: Path) -> int:
+    """
+    Remove stale/incomplete SPEECHCOMMANDS download artifacts.
+
+    torchaudio downloads may leave files like:
+      speech_commands_v0.02.tar.gz.<hash>.partial
+    when a session is interrupted. Those can break subsequent runs.
+
+    Returns:
+        Number of files deleted.
+    """
+
+    deleted = 0
+    if not root.exists():
+        return 0
+    for p in root.glob("speech_commands_v0.02.tar.gz*.partial"):
+        try:
+            p.unlink()
+            deleted += 1
+        except Exception:
+            pass
+    return deleted
 
 
 def _try_sklearn():
@@ -173,8 +196,14 @@ def _train(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds = SpeechCommandsMelDataset(root=root, subset="training", max_samples=max_train_samples, seed=seed)
-    val_ds = SpeechCommandsMelDataset(root=root, subset="validation", max_samples=max_val_samples, seed=seed + 1)
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True)
+    deleted = _cleanup_speechcommands_partials(root_path)
+    if deleted > 0:
+        print(f"Removed {deleted} stale SPEECHCOMMANDS .partial file(s) under: {root_path}")
+
+    train_ds = SpeechCommandsMelDataset(root=str(root_path), subset="training", max_samples=max_train_samples, seed=seed)
+    val_ds = SpeechCommandsMelDataset(root=str(root_path), subset="validation", max_samples=max_val_samples, seed=seed + 1)
 
     num_classes = len(train_ds.labels)
 
