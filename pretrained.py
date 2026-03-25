@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import argparse
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, Dataset, Subset
+
+from command_classifier.config import (
+    AUDIO_DURATION_S,
+    AUDIO_SAMPLES,
+    BATCH_SIZE,
+    F_MAX,
+    F_MIN,
+    HOP_LENGTH,
+    LR,
+    N_FFT,
+    N_MELS,
+    NUM_WORKERS,
+    SAMPLE_RATE,
+    WEIGHT_DECAY,
+)
+from command_classifier.model.classifier import build_model
+from command_classifier.preprocessing.audio import normalize_waveform, pad_or_truncate
+from command_classifier.preprocessing.mel import create_mel_transform, mel_to_image, waveform_to_mel
+
+
+def _try_sklearn():
+    try:
+        from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+        return {
+            "accuracy_score": accuracy_score,
+            "f1_score": f1_score,
+            "precision_score": precision_score,
+            "recall_score": recall_score,
+        }
+    except Exception:
+        return {}
+
+
+class SpeechCommandsMelDataset(Dataset):
+    """
+    SPEECHCOMMANDS -> fixed-length waveform -> mel -> 3x224x224 image.
+
+    Uses the same mel pipeline as the few-shot command detector so the backbone
+    transfers cleanly.
+    """
+
+    def __init__(self, root: str, subset: str, max_samples: Optional[int] = None, seed: int = 1234) -> None:
+        super().__init__()
+
+        try:
+            import torchaudio
+        except Exception as e:  # pragma: no cover
+            raise ImportError("torchaudio is required to use SPEECHCOMMANDS.") from e
+
+        self.root = root
+        self.subset = subset
+        self.max_samples = max_samples
+        self.seed = seed
+
+        self.ds = torchaudio.datasets.SPEECHCOMMANDS(root=root, download=True, subset=subset)
+
+        # Build label mapping
+        labels = sorted({self.ds[i][2] for i in range(len(self.ds))})
+        self.labels = labels
+        self.label_to_idx = {lab: i for i, lab in enumerate(labels)}
+
+        self.mel_transform = create_mel_transform()
+
+        # Optional subsampling for speed
+        self.indices = list(range(len(self.ds)))
+        if max_samples is not None and max_samples < len(self.indices):
+            rng = np.random.default_rng(seed)
+            self.indices = rng.choice(self.indices, size=max_samples, replace=False).tolist()
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        real_idx = self.indices[idx]
+        waveform, sr, label, *_ = self.ds[real_idx]
+
+        # Mono, float32
+        if waveform.dim() != 2:
+            raise ValueError(f"Unexpected waveform shape: {tuple(waveform.shape)}")
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        waveform = waveform.to(torch.float32)
+
+        # Resample if needed (torchaudio required; handled by load pipeline normally)
+        if sr != SAMPLE_RATE:
+            import torchaudio
+
+            waveform = torchaudio.transforms.Resample(orig_sr=sr, new_sr=SAMPLE_RATE)(waveform)
+
+        waveform = pad_or_truncate(waveform, AUDIO_SAMPLES, mode="center")
+        waveform = normalize_waveform(waveform)
+
+        mel_db = waveform_to_mel(waveform, self.mel_transform)
+        img = mel_to_image(mel_db, image_size=224)
+        y = self.label_to_idx[label]
+        return img, y
+
+
+def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    sk = _try_sklearn()
+    if not sk:
+        acc = float((y_true == y_pred).mean())
+        return {"accuracy": acc, "f1_macro": 0.0, "precision_macro": 0.0, "recall_macro": 0.0}
+
+    return {
+        "accuracy": float(sk["accuracy_score"](y_true, y_pred)),
+        "f1_macro": float(sk["f1_score"](y_true, y_pred, average="macro", zero_division=0)),
+        "precision_macro": float(sk["precision_score"](y_true, y_pred, average="macro", zero_division=0)),
+        "recall_macro": float(sk["recall_score"](y_true, y_pred, average="macro", zero_division=0)),
+    }
+
+
+@torch.no_grad()
+def _eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, Dict[str, float]]:
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+
+    total_loss = 0.0
+    total = 0
+    y_true: List[int] = []
+    y_pred: List[int] = []
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True).long()
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        total_loss += float(loss.item()) * x.size(0)
+        total += x.size(0)
+
+        preds = logits.argmax(dim=1)
+        y_true.extend(y.detach().cpu().numpy().tolist())
+        y_pred.extend(preds.detach().cpu().numpy().tolist())
+
+    avg_loss = total_loss / max(1, total)
+    metrics = _compute_metrics(np.array(y_true), np.array(y_pred))
+    return avg_loss, metrics
+
+
+def _train(
+    *,
+    root: str,
+    out_path: Path,
+    epochs: int,
+    gpus: str,
+    batch_size: int,
+    lr: float,
+    weight_decay: float,
+    max_train_samples: Optional[int],
+    max_val_samples: Optional[int],
+    num_workers: int,
+    seed: int,
+) -> None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_ds = SpeechCommandsMelDataset(root=root, subset="training", max_samples=max_train_samples, seed=seed)
+    val_ds = SpeechCommandsMelDataset(root=root, subset="validation", max_samples=max_val_samples, seed=seed + 1)
+
+    num_classes = len(train_ds.labels)
+
+    model = build_model(pretrained=True, num_classes=num_classes)
+    model = model.to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_f1 = -1.0
+    best_state: Optional[dict] = None
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        t0 = time.time()
+
+        total_loss = 0.0
+        total = 0
+        y_true: List[int] = []
+        y_pred: List[int] = []
+
+        for x, y in train_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True).long()
+
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=(device.type == "cuda")):
+                logits = model(x)
+                loss = criterion(logits, y)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            total_loss += float(loss.item()) * x.size(0)
+            total += x.size(0)
+
+            preds = logits.argmax(dim=1)
+            y_true.extend(y.detach().cpu().numpy().tolist())
+            y_pred.extend(preds.detach().cpu().numpy().tolist())
+
+        train_loss = total_loss / max(1, total)
+        train_metrics = _compute_metrics(np.array(y_true), np.array(y_pred))
+
+        val_loss, val_metrics = _eval_epoch(model, val_loader, device)
+
+        dt = time.time() - t0
+        print(
+            f"epoch {epoch:03d}/{epochs} | "
+            f"train_loss={train_loss:.4f} acc={train_metrics['accuracy']:.4f} f1m={train_metrics['f1_macro']:.4f} | "
+            f"val_loss={val_loss:.4f} acc={val_metrics['accuracy']:.4f} f1m={val_metrics['f1_macro']:.4f} | "
+            f"{dt:.1f}s"
+        )
+
+        if val_metrics["f1_macro"] > best_val_f1:
+            best_val_f1 = float(val_metrics["f1_macro"])
+            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    if best_state is None:
+        best_state = model.state_dict()
+
+    # Save backbone only (features.*)
+    backbone = build_model(pretrained=False, num_classes=num_classes)
+    backbone.load_state_dict(best_state, strict=True)
+
+    payload = {
+        "features_state_dict": backbone.features.state_dict(),
+        "pretrain_meta": {
+            "dataset": "SPEECHCOMMANDS",
+            "labels": train_ds.labels,
+            "sample_rate": SAMPLE_RATE,
+            "audio_duration_s": AUDIO_DURATION_S,
+            "n_fft": N_FFT,
+            "hop_length": HOP_LENGTH,
+            "n_mels": N_MELS,
+            "f_min": F_MIN,
+            "f_max": F_MAX,
+            "image_size": 224,
+            "imagenet_mean": [0.485, 0.456, 0.406],
+            "imagenet_std": [0.229, 0.224, 0.225],
+        },
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, str(out_path))
+    print(f"Saved backbone checkpoint to: {out_path}")
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    ap = argparse.ArgumentParser(description="Stage A: pretrain backbone on SPEECHCOMMANDS (multiclass).")
+    ap.add_argument("--out", required=True, help="Output .pt path (backbone-only checkpoint).")
+    ap.add_argument("--epochs", type=int, default=5, help="Number of epochs to train.")
+    ap.add_argument("--root", default="./data/speechcommands", help="SPEECHCOMMANDS dataset root/cache directory.")
+    ap.add_argument("--gpus", default="0", help="CUDA_VISIBLE_DEVICES (e.g. '0' or '0,1').")
+    ap.add_argument("--batch-size", type=int, default=128, help="Batch size.")
+    ap.add_argument("--lr", type=float, default=float(LR), help="Learning rate.")
+    ap.add_argument("--weight-decay", type=float, default=float(WEIGHT_DECAY), help="Weight decay.")
+    ap.add_argument("--num-workers", type=int, default=int(NUM_WORKERS), help="DataLoader workers.")
+    ap.add_argument("--seed", type=int, default=1234, help="Random seed.")
+    ap.add_argument("--max-train-samples", type=int, default=30000, help="Cap training samples for speed.")
+    ap.add_argument("--max-val-samples", type=int, default=5000, help="Cap validation samples for speed.")
+    args = ap.parse_args(argv)
+
+    _train(
+        root=args.root,
+        out_path=Path(args.out),
+        epochs=int(args.epochs),
+        gpus=str(args.gpus),
+        batch_size=int(args.batch_size),
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
+        max_train_samples=int(args.max_train_samples) if args.max_train_samples and args.max_train_samples > 0 else None,
+        max_val_samples=int(args.max_val_samples) if args.max_val_samples and args.max_val_samples > 0 else None,
+        num_workers=int(args.num_workers),
+        seed=int(args.seed),
+    )
+
+
+if __name__ == "__main__":
+    main()
+

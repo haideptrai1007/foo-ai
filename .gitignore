@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Environments
+.env
+.venv/
+venv/
+ENV/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Jupyter / Kaggle
+.ipynb_checkpoints/
+*.ipynb
+
+# Data / artifacts (don’t commit)
+data/
+checkpoints/
+export/
+*.pt
+*.pth
+*.onnx
+*.zip
+*.png
+*.csv
+*.json
+
+# Logs
+*.log
+
+# Audio
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.wma
+

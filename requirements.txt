@@ -1,0 +1,11 @@
+torch
+torchvision
+torchaudio
+gradio
+onnx
+onnxruntime
+scikit-learn
+matplotlib
+seaborn
+numpy
+
