@@ -12,7 +12,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+try:
+    from torch.amp import GradScaler, autocast  # PyTorch >= 2.0
+except ImportError:  # pragma: no cover
+    from torch.cuda.amp import GradScaler, autocast  # type: ignore[no-redef]
 
 from command_classifier.config import (
     BATCH_SIZE,
@@ -105,7 +108,7 @@ class CNNTrainer:
         self.optimizer = torch.optim.AdamW(param_groups, lr=LR, weight_decay=WEIGHT_DECAY)
 
         # AMP
-        self.scaler = GradScaler(enabled=(self.device.type == "cuda"))
+        self.scaler = GradScaler("cuda", enabled=(self.device.type == "cuda"))
 
         self.best_val_loss = float("inf")
         self.best_path: Optional[Path] = None
@@ -188,7 +191,7 @@ class CNNTrainer:
             if train:
                 self.optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=(self.device.type == "cuda")):
+            with autocast("cuda", enabled=(self.device.type == "cuda")):
                 logits = self.model(images)
                 # logits shape: (batch, 1) typically
                 logits = logits.view(-1)
