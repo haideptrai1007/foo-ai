@@ -15,6 +15,7 @@ from command_classifier.config import (
     F_MAX,
     F_MIN,
     HOP_LENGTH,
+    IMAGE_SIZE,
     MEL_NORM,
     N_FFT,
     N_MELS,
@@ -70,7 +71,7 @@ def waveform_to_mel(waveform: torch.Tensor, mel_transform: "torchaudio.transform
     return mel_db
 
 
-def mel_to_image(mel_db: torch.Tensor, image_size: int = 224) -> torch.Tensor:
+def mel_to_image(mel_db: torch.Tensor, image_size: int = IMAGE_SIZE) -> torch.Tensor:
     """
     Convert mel-dB tensor to an ImageNet-normalized 3x224x224 tensor.
 
@@ -106,7 +107,7 @@ def mel_to_image(mel_db: torch.Tensor, image_size: int = 224) -> torch.Tensor:
     return img_norm
 
 
-def full_pipeline(waveform: torch.Tensor, image_size: int = 224) -> torch.Tensor:
+def full_pipeline(waveform: torch.Tensor, image_size: int = IMAGE_SIZE) -> torch.Tensor:
     """
     Convenience wrapper: waveform -> mel-db -> image tensor.
     """

@@ -257,10 +257,17 @@ def create_app(backbone_ckpt: Optional[str] = None):
 
                 yield emit("Training complete."), metrics
 
+            def _sync_ckpt_path(ckpt_dir):
+                return str(Path(ckpt_dir) / "best.pt")
+
             train_btn.click(
                 fn=on_train,
                 inputs=[clips_state, train_epochs, ckpt_dir_box],
                 outputs=[train_log, train_result],
+            ).then(
+                fn=_sync_ckpt_path,
+                inputs=[ckpt_dir_box],
+                outputs=[test_ckpt],
             )
 
         # ── Tab 3: Test (real-time) ──────────────────────────────────────────
@@ -280,6 +287,8 @@ def create_app(backbone_ckpt: Optional[str] = None):
             def on_test(ckpt, threshold, audio):
                 if audio is None:
                     return "No audio recorded.", 0.0, 0.0
+                if not Path(ckpt).exists():
+                    return f"Checkpoint not found: {ckpt}", 0.0, 0.0
                 from command_classifier.inference.torch_infer import TorchInference
 
                 infer = TorchInference(checkpoint_path=ckpt, threshold=threshold)
@@ -312,6 +321,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
                     F_MAX,
                     F_MIN,
                     HOP_LENGTH,
+                    IMAGE_SIZE,
                     N_FFT,
                     N_MELS,
                     SAMPLE_RATE,
@@ -338,7 +348,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
                     "n_mels": N_MELS,
                     "f_min": F_MIN,
                     "f_max": F_MAX,
-                    "image_size": 224,
+                    "image_size": IMAGE_SIZE,
                     "imagenet_mean": [0.485, 0.456, 0.406],
                     "imagenet_std": [0.229, 0.224, 0.225],
                     "confidence_threshold": float(payload.get("metrics", {}).get("optimal_threshold", CONFIDENCE_THRESHOLD)),

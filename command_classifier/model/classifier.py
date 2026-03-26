@@ -45,10 +45,10 @@ def build_model(pretrained: bool = True, num_classes: int = 1, dropout: float = 
         raise RuntimeError("Could not infer classifier in_features.")
 
     model.classifier = nn.Sequential(
-        nn.Linear(in_features, 1024),
+        nn.Linear(in_features, 256),
         nn.Hardswish(),
         nn.Dropout(p=float(dropout)),
-        nn.Linear(1024, int(num_classes)),
+        nn.Linear(256, int(num_classes)),
     )
     return model
 

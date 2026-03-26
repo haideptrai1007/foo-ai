@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 from command_classifier.config import (
     AUG_FACTOR,
     AUDIO_SAMPLES,
+    IMAGE_SIZE,
     NEG_RATIO,
     NEG_SOURCES,
     NUM_WORKERS,
@@ -200,7 +201,7 @@ class CommandDataset(Dataset):
         mel_db = self._cache[idx]
         if self.augment:
             mel_db = self.pipeline.augment_spectrogram(mel_db)
-        img = mel_to_image(mel_db, image_size=224)
+        img = mel_to_image(mel_db, image_size=IMAGE_SIZE)
         label = self.labels[idx // (AUG_FACTOR if self.augment else 1)]
         return img, label
 

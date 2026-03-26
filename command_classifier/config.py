@@ -25,9 +25,9 @@ AUDIO_SAMPLES: Final[int] = int(SAMPLE_RATE * AUDIO_DURATION_S)
 # ----------------------------
 # Mel-spectrogram
 # ----------------------------
-N_FFT: Final[int] = 1024
-HOP_LENGTH: Final[int] = 256
-N_MELS: Final[int] = 128
+N_FFT: Final[int] = 512
+HOP_LENGTH: Final[int] = 128
+N_MELS: Final[int] = 64
 F_MIN: Final[int] = 60
 F_MAX: Final[int] = 7800
 MEL_NORM: Final[str] = "slaney"
@@ -35,7 +35,8 @@ MEL_NORM: Final[str] = "slaney"
 # ----------------------------
 # Augmentation
 # ----------------------------
-AUG_FACTOR: Final[int] = 10
+AUG_FACTOR: Final[int] = 5
+IMAGE_SIZE: Final[int] = 96  # input resolution for MobileNetV3 — smaller = faster on-device inference
 NOISE_SNR_RANGE: Final[Tuple[float, float]] = (5.0, 30.0)  # dB
 PITCH_SHIFT_RANGE: Final[Tuple[float, float]] = (-2.0, 2.0)  # semitones
 TIME_STRETCH_RANGE: Final[Tuple[float, float]] = (0.85, 1.15)
