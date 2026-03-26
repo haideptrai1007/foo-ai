@@ -198,11 +198,14 @@ def create_app(backbone_ckpt: Optional[str] = None):
                     )
 
                     n_train = len(train_loader.dataset)
-                    n_val = len(val_loader.dataset)
+                    n_val = len(val_loader.dataset) if val_loader is not None else 0
+                    val_info = (
+                        f", {n_val} val samples | Train batches: {len(train_loader)}  Val batches: {len(val_loader)}"
+                        if val_loader is not None
+                        else " (no val split — all samples used for training)"
+                    )
                     yield emit(
-                        f"Dataset: {n_train} train samples, {n_val} val samples "
-                        f"({n_train + n_val} total incl. augmentation) | "
-                        f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}"
+                        f"Dataset: {n_train} train samples{val_info}"
                     ), None
                     yield emit("Building model..."), None
 
