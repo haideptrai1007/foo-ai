@@ -226,7 +226,7 @@ class CNNTrainer:
         labels_np = np.array(all_labels, dtype=np.int64)
         metrics = self._compute_metrics(probs_np, labels_np)
 
-        return avg_loss, metrics
+        return avg_loss, metrics, probs_np, labels_np
 
     def _save_checkpoint(self, path: Path, epoch: int, metrics: Dict[str, Any]) -> None:
         payload = {
@@ -273,17 +273,27 @@ class CNNTrainer:
                 pct_start=0.3,
             )
 
-        scheduler = make_scheduler(epochs)
-
         # Backbone stays frozen for the entire training — pretrained on SPEECHCOMMANDS,
         # so features are already audio-adapted. Only the classifier head trains.
         scheduler = make_scheduler(epochs)
+        train_loss = 0.0
+        last_probs: np.ndarray = np.array([], dtype=np.float32)
+        last_labels: np.ndarray = np.array([], dtype=np.int64)
         for epoch in range(self.initial_epoch, epochs):
             start = time.time()
-            train_loss, train_metrics = self._run_one_epoch(train=True, scheduler=scheduler)
+            train_loss, train_metrics, last_probs, last_labels = self._run_one_epoch(train=True, scheduler=scheduler)
             elapsed = time.time() - start
 
             self.history["train_loss"].append(float(train_loss))
+
+            if self.val_loader is not None:
+                val_loss, val_metrics, last_probs, last_labels = self._run_one_epoch(train=False)
+                self.history["val_loss"].append(float(val_loss))
+                self.history["val_accuracy"].append(val_metrics["accuracy"])
+                self.history["val_precision"].append(val_metrics["precision"])
+                self.history["val_recall"].append(val_metrics["recall"])
+                self.history["val_f1"].append(val_metrics["f1"])
+                self.history["val_auc"].append(val_metrics["auc"])
 
             _log(
                 f"epoch {epoch+1}/{epochs} | "
@@ -301,6 +311,6 @@ class CNNTrainer:
         return {
             "best_path": str(self.best_path),
             "best_metrics": best_metrics,
-            "optimal_threshold": float(CONFIDENCE_THRESHOLD),
+            "optimal_threshold": self._optimal_threshold(last_probs, last_labels),
         }
 

@@ -257,17 +257,10 @@ def create_app(backbone_ckpt: Optional[str] = None):
 
                 yield emit("Training complete."), metrics
 
-            def _sync_ckpt_path(ckpt_dir):
-                return str(Path(ckpt_dir) / "best.pt")
-
-            train_btn.click(
+            train_click = train_btn.click(
                 fn=on_train,
                 inputs=[clips_state, train_epochs, ckpt_dir_box],
                 outputs=[train_log, train_result],
-            ).then(
-                fn=_sync_ckpt_path,
-                inputs=[ckpt_dir_box],
-                outputs=[test_ckpt],
             )
 
         # ── Tab 3: Test (real-time) ──────────────────────────────────────────
@@ -275,6 +268,12 @@ def create_app(backbone_ckpt: Optional[str] = None):
             gr.Markdown("Record a clip and run inference. Inference time and probability are shown.")
 
             test_ckpt = gr.Textbox(label="Checkpoint (.pt) path", value=str(CHECKPOINT_DIR / "best.pt"))
+
+            train_click.then(
+                fn=lambda ckpt_dir: str(Path(ckpt_dir) / "best.pt"),
+                inputs=[ckpt_dir_box],
+                outputs=[test_ckpt],
+            )
             test_threshold = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.01, label="Threshold")
             test_audio = gr.Audio(sources=["microphone"], type="numpy", label="Microphone")
             test_btn = gr.Button("Run Inference", variant="primary")
