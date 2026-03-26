@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
 from command_classifier.config import (
     AUDIO_DURATION_S,
@@ -29,6 +29,50 @@ from command_classifier.config import (
 from command_classifier.model.classifier import build_model
 from command_classifier.preprocessing.audio import normalize_waveform, pad_or_truncate
 from command_classifier.preprocessing.mel import create_mel_transform, mel_to_image, waveform_to_mel
+
+
+_W = 64  # box width
+
+
+def _print_header(epochs: int, batch_size: int, lr: float, device: str) -> None:
+    print("╔" + "═" * _W + "╗")
+    title = "Stage A — SPEECHCOMMANDS Backbone Pretraining"
+    print(f"║  {title:<{_W - 2}}║")
+    info = f"Epochs: {epochs}   Batch: {batch_size}   LR: {lr:.0e}   Device: {device}"
+    print(f"║  {info:<{_W - 2}}║")
+    print("╚" + "═" * _W + "╝")
+    print()
+
+
+def _print_epoch(
+    epoch: int,
+    epochs: int,
+    elapsed: float,
+    train_loss: float,
+    train_metrics: dict,
+    val_loss: float,
+    val_metrics: dict,
+    is_best: bool,
+) -> None:
+    best_tag = "  ★ new best" if is_best else ""
+    print(f"Epoch {epoch:>3} / {epochs}  [{elapsed:.1f}s]")
+    print(
+        f"  Train │ loss: {train_loss:.4f}  acc: {train_metrics['accuracy'] * 100:.2f}%"
+        f"  f1: {train_metrics['f1_macro'] * 100:.2f}%"
+    )
+    print(
+        f"  Val   │ loss: {val_loss:.4f}  acc: {val_metrics['accuracy'] * 100:.2f}%"
+        f"  f1: {val_metrics['f1_macro'] * 100:.2f}%{best_tag}"
+    )
+    print()
+
+
+def _print_summary(best_epoch: int, best_val_f1: float, out_path: Path) -> None:
+    print("═" * (_W + 2))
+    print(f"  Best epoch : {best_epoch}")
+    print(f"  val_f1_macro: {best_val_f1 * 100:.2f}%")
+    print(f"  Saved backbone → {out_path}")
+    print("═" * (_W + 2))
 
 
 def _cleanup_speechcommands_partials(root: Path) -> int:
@@ -189,12 +233,14 @@ def _train(
     max_val_samples: Optional[int],
     num_workers: int,
     seed: int,
+    no_data_parallel: bool,
 ) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _print_header(epochs=epochs, batch_size=batch_size, lr=lr, device=str(device))
 
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
@@ -210,7 +256,17 @@ def _train(
     model = build_model(pretrained=True, num_classes=num_classes)
     model = model.to(device)
 
+    # Build optimizer BEFORE DataParallel wrapping, then wrap model.
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    use_data_parallel = (not no_data_parallel) and device.type == "cuda" and torch.cuda.device_count() > 1
+    if use_data_parallel:
+        model = nn.DataParallel(model)
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
+    else:
+        if device.type == "cuda":
+            print(f"Using single GPU (cuda:{torch.cuda.current_device()})")
+        else:
+            print("Using CPU")
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
     train_loader = DataLoader(
@@ -233,6 +289,7 @@ def _train(
     criterion = nn.CrossEntropyLoss()
 
     best_val_f1 = -1.0
+    best_epoch = 0
     best_state: Optional[dict] = None
 
     for epoch in range(1, epochs + 1):
@@ -270,26 +327,38 @@ def _train(
         val_loss, val_metrics = _eval_epoch(model, val_loader, device)
 
         dt = time.time() - t0
-        print(
-            f"epoch {epoch:03d}/{epochs} | "
-            f"train_loss={train_loss:.4f} acc={train_metrics['accuracy']:.4f} f1m={train_metrics['f1_macro']:.4f} | "
-            f"val_loss={val_loss:.4f} acc={val_metrics['accuracy']:.4f} f1m={val_metrics['f1_macro']:.4f} | "
-            f"{dt:.1f}s"
+        is_best = val_metrics["f1_macro"] > best_val_f1
+        _print_epoch(
+            epoch=epoch,
+            epochs=epochs,
+            elapsed=dt,
+            train_loss=train_loss,
+            train_metrics=train_metrics,
+            val_loss=val_loss,
+            val_metrics=val_metrics,
+            is_best=is_best,
         )
 
-        if val_metrics["f1_macro"] > best_val_f1:
+        if is_best:
             best_val_f1 = float(val_metrics["f1_macro"])
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            best_epoch = epoch
+            model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            best_state = {k: v.cpu() for k, v in model_state.items()}
 
     if best_state is None:
-        best_state = model.state_dict()
+        # Defensive fallback: if no epoch improved (unlikely), save final model.
+        model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        best_state = {k: v.cpu() for k, v in model_state.items()}
+        best_epoch = epochs
 
-    # Save backbone only (features.*)
+    # Save backbone only (features.*) from the best validation epoch.
     backbone = build_model(pretrained=False, num_classes=num_classes)
     backbone.load_state_dict(best_state, strict=True)
 
     payload = {
         "features_state_dict": backbone.features.state_dict(),
+        "best_epoch": best_epoch,
+        "best_val_f1_macro": float(best_val_f1),
         "pretrain_meta": {
             "dataset": "SPEECHCOMMANDS",
             "labels": train_ds.labels,
@@ -308,7 +377,7 @@ def _train(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, str(out_path))
-    print(f"Saved backbone checkpoint to: {out_path}")
+    _print_summary(best_epoch=best_epoch, best_val_f1=best_val_f1, out_path=out_path)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -324,6 +393,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--seed", type=int, default=1234, help="Random seed.")
     ap.add_argument("--max-train-samples", type=int, default=30000, help="Cap training samples for speed.")
     ap.add_argument("--max-val-samples", type=int, default=5000, help="Cap validation samples for speed.")
+    ap.add_argument(
+        "--no-data-parallel",
+        action="store_true",
+        help="Disable DataParallel even when multiple GPUs are visible.",
+    )
     args = ap.parse_args(argv)
 
     _train(
@@ -338,6 +412,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_val_samples=int(args.max_val_samples) if args.max_val_samples and args.max_val_samples > 0 else None,
         num_workers=int(args.num_workers),
         seed=int(args.seed),
+        no_data_parallel=bool(args.no_data_parallel),
     )
 
 

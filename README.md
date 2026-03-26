@@ -1,11 +1,11 @@
 # 1‑Class Audio Command Classifier (MobileNetV3‑Small)
 
-Binary classifier: **“is this audio clip my target command?”** (yes/no), trained on mel‑spectrograms using a MobileNetV3‑Small ImageNet backbone.
+Binary classifier: **"is this audio clip my target command?"** (yes/no), trained on mel‑spectrograms using a MobileNetV3‑Small backbone.
 
-This repo supports:
+Two stages:
 
-- **Stage A (optional)**: pretrain a **speech‑domain backbone** on `torchaudio.datasets.SPEECHCOMMANDS` (multiclass), then save **backbone‑only** weights.
-- **Stage B**: few‑shot fine‑tune a **binary** command detector from your own recorded samples, then export ONNX (and INT8 quantized ONNX).
+- **Stage A (optional)**: pretrain a speech‑domain backbone on `SPEECHCOMMANDS` (multiclass), save backbone‑only weights.
+- **Stage B**: few‑shot binary command detector — record samples in the UI, train, test in real-time, then export to ONNX.
 
 ---
 
@@ -19,12 +19,12 @@ command_classifier/
   training/
   inference/
   export/
-  ui/
-pretrained.py   # Stage A backbone pretrain (SPEECHCOMMANDS)
-train.py        # Stage B training (folder-based positives/negatives)
-test.py         # Stage B inference (checkpoint + audio)
-export.py       # Export checkpoint -> ONNX -> INT8 + zip bundle
-main.py         # Gradio UI entrypoint (minimal)
+  ui/app.py       # Gradio few-shot UI
+pretrained.py     # Stage A backbone pretrain (SPEECHCOMMANDS)
+train.py          # Stage B training (folder-based CLI)
+test.py           # Stage B inference (CLI)
+export.py         # Export checkpoint -> ONNX -> INT8 + zip bundle
+main.py           # UI entrypoint
 requirements.txt
 ```
 
@@ -32,65 +32,80 @@ requirements.txt
 
 ## Install
 
-### Kaggle
-
-In a Kaggle notebook cell:
-
 ```bash
-pip install -q -r requirements.txt
+pip install -r requirements.txt
 ```
-
-If Kaggle already provides some packages, installing again is still fine.
 
 ---
 
-## Data format (Stage B)
+## Stage A (optional): Pretrain backbone on SPEECHCOMMANDS
 
-Stage B expects folders of audio files:
-
-```
-./data/positive/   # 5–10 clips of your command
-./data/negative/   # optional (if absent, code generates synthetic negatives)
-```
-
-Supported extensions include: `.wav .mp3 .flac .ogg .m4a .aac .wma`.
-
----
-
-## Stage A (optional): pretrain backbone on SPEECHCOMMANDS
-
-If your command is **not** one of SPEECHCOMMANDS labels (common), you can still use it to pretrain a backbone on *speech* so the model adapts faster in few‑shot.
-
-This script trains **multiclass** on SPEECHCOMMANDS and saves a **backbone‑only** checkpoint:
+Pretrains a multiclass backbone on speech audio so it transfers better to your command.
 
 ```bash
 python pretrained.py \
-  --out ./pretrained_backbone_sc.pt \
+  --out ./pretrained_backbone.pt \
   --epochs 5 \
-  --gpus 0 \
+  --gpus 0,1 \
   --root ./data/speechcommands \
   --max-train-samples 30000 \
   --max-val-samples 5000
 ```
 
-It logs per epoch:
+**Structured training output:**
+```
+╔════════════════════════════════════════════════════════════════╗
+║  Stage A — SPEECHCOMMANDS Backbone Pretraining                 ║
+║  Epochs: 5   Batch: 128   LR: 1e-03   Device: cuda:0          ║
+╚════════════════════════════════════════════════════════════════╝
 
-- train/val loss
-- accuracy
-- macro F1
+Epoch   1 / 5  [12.3s]
+  Train │ loss: 0.4321  acc: 87.65%  f1: 84.32%
+  Val   │ loss: 0.3210  acc: 90.12%  f1: 89.01%  ★ new best
 
-### Output checkpoint format
+...
 
-`pretrained.py` saves:
+══════════════════════════════════════════════════════════════════
+  Best epoch : 4
+  val_f1_macro: 92.34%
+  Saved backbone → pretrained_backbone.pt
+══════════════════════════════════════════════════════════════════
+```
 
-- `features_state_dict`: MobileNetV3‑Small `.features` weights
-- `pretrain_meta`: mel/audio params used during pretraining
+Saves:
+- `features_state_dict` — MobileNetV3‑Small `.features` weights
+- `pretrain_meta` — mel/audio config used during pretraining
+
+Flags:
+- `--no-data-parallel` — disable DataParallel even when multiple GPUs are visible
 
 ---
 
-## Stage B: few‑shot training (binary command detector)
+## Stage B: Few-shot training via Gradio UI
 
-### Train (folder-based)
+### Launch
+
+```bash
+# Default (raw ImageNet MobileNetV3 backbone)
+python main.py
+
+# With Stage A pretrained backbone
+python main.py --ckpt ./pretrained_backbone.pt
+
+# Custom port / public share link
+python main.py --ckpt ./pretrained_backbone.pt --port 8080 --share
+```
+
+### UI workflow (4 tabs)
+
+| Tab | What to do |
+|-----|-----------|
+| **1 · Record** | Set samples-per-class target, record via microphone, save as Positive or Negative |
+| **2 · Train** | Set epochs, start training — live log streams as it runs, final metrics shown as JSON |
+| **3 · Test** | Record a clip, run inference — see label, probability, and inference time (ms) |
+| **4 · Export** | Export trained checkpoint to FP32 + INT8 ONNX and a deployable zip bundle |
+
+### Folder-based CLI training (alternative)
 
 ```bash
 python train.py \
@@ -100,51 +115,35 @@ python train.py \
   --gpus 0,1
 ```
 
-Notes:
-
-- If you only want one GPU, use `--gpus 0`.
-- The current Stage B CLI trains from folders; it does **not** yet auto-load the Stage A backbone checkpoint.
-
-### Test a clip
+### CLI inference
 
 ```bash
 python test.py \
-  --checkpoint ./checkpoints/best_epoch_000.pt \
-  --audio ./some_clip.wav \
+  --checkpoint ./checkpoints/best.pt \
+  --audio ./clip.wav \
   --threshold 0.52
 ```
 
 ---
 
-## Export (ONNX + INT8 quant + zip bundle)
+## Export (CLI)
 
 ```bash
 python export.py \
-  --checkpoint ./checkpoints/best_epoch_000.pt \
+  --checkpoint ./checkpoints/best.pt \
   --export-dir ./export \
   --quantize-mode dynamic
 ```
 
 Outputs:
-
 - `export/model_fp32.onnx`
 - `export/model_int8.onnx`
-- `export/command_classifier_export.zip` (contains `model.onnx`, `config.json`, `inference.py`, `requirements_inference.txt`)
+- `export/command_classifier_export.zip` — contains `model.onnx`, `config.json`, `inference.py`
 
 ---
 
-## Gradio UI (minimal)
+## Tips
 
-Launch the UI:
-
-```bash
-python main.py
-```
-
----
-
-## Notes / tips
-
-- **Few-shot works best with real speech negatives** (background speech / “wrong command” speech). Synthetic noise/silence helps, but speech negatives reduce false positives.
-- Keep preprocessing consistent across stages: waveform → mel → normalize → resize → ImageNet normalize.
-
+- **Few-shot works best with real speech negatives.** Synthetic noise/silence helps, but background speech reduces false positives significantly.
+- Keep preprocessing consistent: waveform → mel → normalize → 224×224 → ImageNet normalize.
+- For best results with Stage A, use a GPU; the pretrain step is the slowest part.
