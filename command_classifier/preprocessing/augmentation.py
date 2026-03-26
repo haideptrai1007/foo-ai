@@ -125,7 +125,8 @@ class AugmentationPipeline:
 
     def _time_stretch(self, waveform: Tensor) -> Tensor:
         rate = random.uniform(float(TIME_STRETCH_RANGE[0]), float(TIME_STRETCH_RANGE[1]))
-        stretched = torchaudio.functional.speed(waveform, orig_freq=SAMPLE_RATE, factor=rate)
+        result = torchaudio.functional.speed(waveform, orig_freq=SAMPLE_RATE, factor=rate)
+        stretched = result[0] if isinstance(result, (tuple, list)) else result
         if stretched.size(-1) == AUDIO_SAMPLES:
             return stretched
         if stretched.size(-1) < AUDIO_SAMPLES:
