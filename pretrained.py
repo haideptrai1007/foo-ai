@@ -9,10 +9,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-try:
-    from torch.amp import GradScaler, autocast  # PyTorch >= 2.0
-except ImportError:  # pragma: no cover
-    from torch.cuda.amp import GradScaler, autocast  # type: ignore[no-redef]
+import torch.amp as _torch_amp
+_NEW_AMP = hasattr(_torch_amp, "GradScaler")
 from torch.utils.data import DataLoader, Dataset
 
 from command_classifier.config import (
@@ -270,7 +268,8 @@ def _train(
             print(f"Using single GPU (cuda:{torch.cuda.current_device()})")
         else:
             print("Using CPU")
-    scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
+    _enabled = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=_enabled) if _NEW_AMP else torch.cuda.amp.GradScaler(enabled=_enabled)
 
     train_loader = DataLoader(
         train_ds,
@@ -309,7 +308,8 @@ def _train(
             y = y.to(device, non_blocking=True).long()
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast("cuda", enabled=(device.type == "cuda")):
+            _cuda = device.type == "cuda"
+            with (torch.amp.autocast("cuda", enabled=_cuda) if _NEW_AMP else torch.cuda.amp.autocast(enabled=_cuda)):
                 logits = model(x)
                 loss = criterion(logits, y)
 

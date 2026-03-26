@@ -12,10 +12,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-try:
-    from torch.amp import GradScaler, autocast  # PyTorch >= 2.0
-except ImportError:  # pragma: no cover
-    from torch.cuda.amp import GradScaler, autocast  # type: ignore[no-redef]
+# torch.amp.GradScaler (new API) was added in PyTorch 2.3;
+# torch.amp.autocast was added in PyTorch 1.10.
+# Use new API when available, fall back to cuda.amp for older versions.
+import torch.amp as _torch_amp
+_NEW_AMP = hasattr(_torch_amp, "GradScaler")
 
 from command_classifier.config import (
     BATCH_SIZE,
@@ -108,7 +109,11 @@ class CNNTrainer:
         self.optimizer = torch.optim.AdamW(param_groups, lr=LR, weight_decay=WEIGHT_DECAY)
 
         # AMP
-        self.scaler = GradScaler("cuda", enabled=(self.device.type == "cuda"))
+        _enabled = self.device.type == "cuda"
+        if _NEW_AMP:
+            self.scaler = torch.amp.GradScaler("cuda", enabled=_enabled)
+        else:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=_enabled)
 
         self.best_val_loss = float("inf")
         self.best_path: Optional[Path] = None
@@ -191,7 +196,9 @@ class CNNTrainer:
             if train:
                 self.optimizer.zero_grad(set_to_none=True)
 
-            with autocast("cuda", enabled=(self.device.type == "cuda")):
+            _cuda = self.device.type == "cuda"
+            _ctx = torch.amp.autocast("cuda", enabled=_cuda) if _NEW_AMP else torch.cuda.amp.autocast(enabled=_cuda)
+            with _ctx:
                 logits = self.model(images)
                 # logits shape: (batch, 1) typically
                 logits = logits.view(-1)
