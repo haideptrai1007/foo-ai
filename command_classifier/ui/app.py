@@ -31,6 +31,51 @@ def _save_clips_to_dir(clips: List[Tuple[int, np.ndarray]], out_dir: Path) -> No
         sf.write(str(out_dir / f"clip_{i:04d}.wav"), arr, sr)
 
 
+def _trim_silence(arr: np.ndarray, sr: int, top_db: float = 30.0) -> np.ndarray:
+    """
+    Trim leading/trailing silence using an energy threshold.
+
+    Any frame whose RMS energy is below `top_db` dB relative to the peak
+    frame is considered silent and stripped from the edges.
+
+    Returns at least 0.1 s of audio so the clip is never empty.
+    """
+    if arr.ndim > 1:
+        mono = arr.mean(axis=-1)
+    else:
+        mono = arr
+
+    frame_len = max(1, int(sr * 0.02))  # 20 ms frames
+    # Pad so we can reshape cleanly
+    pad = (-len(mono)) % frame_len
+    padded = np.concatenate([mono, np.zeros(pad, dtype=mono.dtype)])
+    frames = padded.reshape(-1, frame_len)
+    rms = np.sqrt((frames.astype(np.float64) ** 2).mean(axis=1))
+
+    peak_rms = rms.max()
+    if peak_rms == 0:
+        return arr  # silent clip — leave unchanged
+
+    threshold = peak_rms * (10.0 ** (-top_db / 20.0))
+    active = np.where(rms >= threshold)[0]
+    if len(active) == 0:
+        return arr
+
+    start_sample = int(active[0]) * frame_len
+    end_sample = min(len(mono), int(active[-1] + 1) * frame_len)
+
+    # Guarantee at least 0.1 s
+    min_len = max(1, int(sr * 0.1))
+    if end_sample - start_sample < min_len:
+        center = (start_sample + end_sample) // 2
+        start_sample = max(0, center - min_len // 2)
+        end_sample = min(len(mono), start_sample + min_len)
+
+    if arr.ndim > 1:
+        return arr[start_sample:end_sample]
+    return arr[start_sample:end_sample]
+
+
 def _load_backbone(model, backbone_ckpt: Optional[str]) -> None:
     """Load Stage A backbone weights into model.features if a checkpoint is given."""
     if not backbone_ckpt:
@@ -88,7 +133,8 @@ def create_app(backbone_ckpt: Optional[str] = None):
                 if len(state["positive"]) >= int(target):
                     return state, _counter_text(state, target)
                 sr, arr = audio
-                state["positive"].append((sr, arr.copy()))
+                arr = _trim_silence(arr.copy(), sr)
+                state["positive"].append((sr, arr))
                 return state, _counter_text(state, target)
 
             def save_negative(audio, state, target):
@@ -97,7 +143,8 @@ def create_app(backbone_ckpt: Optional[str] = None):
                 if len(state["negative"]) >= int(target):
                     return state, _counter_text(state, target)
                 sr, arr = audio
-                state["negative"].append((sr, arr.copy()))
+                arr = _trim_silence(arr.copy(), sr)
+                state["negative"].append((sr, arr))
                 return state, _counter_text(state, target)
 
             def clear_all(_state, target):

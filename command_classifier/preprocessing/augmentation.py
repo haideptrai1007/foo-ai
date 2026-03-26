@@ -11,6 +11,7 @@ try:
 except ImportError:  # pragma: no cover
     torchaudio = None
 
+
 from command_classifier.config import (
     AUDIO_SAMPLES,
     SAMPLE_RATE,
@@ -23,6 +24,29 @@ from command_classifier.config import (
 )
 
 Tensor = torch.Tensor
+
+
+def _probe_torchaudio_ops() -> Tuple[bool, bool]:
+    """Probe once at import time — cheap dummy call to detect available/fast ops."""
+    if torchaudio is None:
+        return False, False
+    _dummy = torch.zeros(1, 1600)
+    has_pitch = False
+    has_speed = False
+    try:
+        torchaudio.functional.pitch_shift(_dummy, sample_rate=16000, n_steps=1.0)
+        has_pitch = True
+    except Exception:
+        pass
+    try:
+        torchaudio.functional.speed(_dummy, orig_freq=16000, factor=1.05)
+        has_speed = True
+    except Exception:
+        pass
+    return has_pitch, has_speed
+
+
+_HAS_PITCH_SHIFT, _HAS_SPEED = _probe_torchaudio_ops()
 
 
 def _require_torchaudio() -> None:
@@ -89,12 +113,8 @@ class AugmentationPipeline:
         return torch.roll(waveform, shifts=shift, dims=-1)
 
     def _pitch_shift(self, waveform: Tensor) -> Tensor:
-        _require_torchaudio()
         steps = random.uniform(float(PITCH_SHIFT_RANGE[0]), float(PITCH_SHIFT_RANGE[1]))
-        try:
-            return torchaudio.functional.pitch_shift(waveform, sample_rate=SAMPLE_RATE, n_steps=steps)
-        except (AttributeError, TypeError, Exception):
-            return waveform
+        return torchaudio.functional.pitch_shift(waveform, sample_rate=SAMPLE_RATE, n_steps=steps)
 
     def _volume_perturb(self, waveform: Tensor) -> Tensor:
         gain = random.uniform(0.7, 1.3)
@@ -104,12 +124,8 @@ class AugmentationPipeline:
         return -waveform if random.random() < 0.5 else waveform
 
     def _time_stretch(self, waveform: Tensor) -> Tensor:
-        _require_torchaudio()
         rate = random.uniform(float(TIME_STRETCH_RANGE[0]), float(TIME_STRETCH_RANGE[1]))
-        try:
-            stretched = torchaudio.functional.speed(waveform, sample_rate=SAMPLE_RATE, factor=rate)
-        except (AttributeError, TypeError, Exception):
-            return waveform
+        stretched = torchaudio.functional.speed(waveform, orig_freq=SAMPLE_RATE, factor=rate)
         if stretched.size(-1) == AUDIO_SAMPLES:
             return stretched
         if stretched.size(-1) < AUDIO_SAMPLES:
@@ -125,17 +141,21 @@ class AugmentationPipeline:
     def augment_audio(self, waveform: Tensor) -> Tensor:
         """
         Apply 2-4 random audio-domain augmentations stochastically.
+        Slow torchaudio ops (pitch_shift, speed) are only included if probed
+        as available and fast at import time.
         """
 
         ops = [
             self._add_gaussian_noise,
             self._add_pink_noise,
             self._time_shift,
-            self._pitch_shift,
-            self._time_stretch,
             self._volume_perturb,
             self._polarity_invert,
         ]
+        if _HAS_PITCH_SHIFT:
+            ops.append(self._pitch_shift)
+        if _HAS_SPEED:
+            ops.append(self._time_stretch)
 
         # Choose a random subset of size 2-4 by independent probabilities,
         # with a hard fallback to ensure we always apply at least 2 ops.

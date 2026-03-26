@@ -25,10 +25,13 @@ from command_classifier.preprocessing.mel import create_mel_transform, mel_to_im
 
 class CommandDataset(Dataset):
     """
-    In-memory dataset of mel-images + binary labels.
+    Lazy dataset: raw waveforms are loaded once, augmentation + mel conversion
+    happen on-the-fly in __getitem__. This makes __init__ fast regardless of
+    AUG_FACTOR, which is critical for few-shot training.
 
-    Each underlying waveform (positive or negative) is augmented `AUG_FACTOR` times
-    (unless augment=False) and converted into a 3x224x224 image tensor.
+    Virtual length = num_raw_waveforms * AUG_FACTOR.
+    Each index maps to (raw_waveform_idx, aug_slot) so every raw sample appears
+    AUG_FACTOR times with a fresh random augmentation each time.
     """
 
     def __init__(
@@ -47,10 +50,11 @@ class CommandDataset(Dataset):
         self.pipeline = AugmentationPipeline()
         self.mel_transform = create_mel_transform()
 
-        self.images: List[torch.Tensor] = []
+        # Raw waveforms loaded once at init; augmentation happens lazily in __getitem__.
+        self._waveforms: List[torch.Tensor] = []
         self.labels: List[torch.Tensor] = []
 
-        self._build_in_memory()
+        self._load_waveforms()
 
     @staticmethod
     def _collect_paths(directory: Path, extensions: Iterable[str]) -> List[Path]:
@@ -134,21 +138,13 @@ class CommandDataset(Dataset):
             negs.append(w)
         return negs
 
-    def _waveform_to_image(self, waveform: torch.Tensor, label: float) -> Tuple[torch.Tensor, torch.Tensor]:
-        mel_db = waveform_to_mel(waveform, self.mel_transform)
-        if self.augment:
-            mel_db = self.pipeline.augment_spectrogram(mel_db)
-        img = mel_to_image(mel_db, image_size=224)
-        return img, torch.tensor([label], dtype=torch.float32)
-
-    def _build_in_memory(self) -> None:
+    def _load_waveforms(self) -> None:
+        """Load raw waveforms once. Fast — no augmentation or mel conversion here."""
         random.seed(self.seed)
-        torch.manual_seed(self.seed)
 
         if len(self.positive_paths) == 0:
             raise ValueError("No positive samples found.")
 
-        # Load positives
         positive_waveforms: List[torch.Tensor] = []
         for p in self.positive_paths:
             try:
@@ -159,7 +155,6 @@ class CommandDataset(Dataset):
         if len(positive_waveforms) == 0:
             raise ValueError("All positive samples failed to load.")
 
-        # Generate a base set of negatives to match NEG_RATIO before augmentation.
         target_neg_base = max(1, int(round(len(positive_waveforms) * float(NEG_RATIO))))
         negative_waveforms = self._generate_negative_waveforms(
             positive_waveforms=positive_waveforms,
@@ -167,7 +162,6 @@ class CommandDataset(Dataset):
             seed=self.seed + 1,
         )
 
-        # Optionally also load user-provided negatives and mix in.
         if len(self.negative_paths) > 0:
             for p in self.negative_paths:
                 try:
@@ -175,36 +169,31 @@ class CommandDataset(Dataset):
                 except Exception as e:
                     warnings.warn(f"Skipping negative '{p}': {e}")
 
-        num_aug = AUG_FACTOR if self.augment else 1
-
-        # Convert all waveform variants to mel images
         for w in positive_waveforms:
-            for _ in range(num_aug):
-                wf = w
-                if self.augment:
-                    wf = self.pipeline.augment_audio(wf)
-                img, y = self._waveform_to_image(wf, label=1.0)
-                self.images.append(img)
-                self.labels.append(y)
+            self._waveforms.append(w)
+            self.labels.append(torch.tensor([1.0], dtype=torch.float32))
 
         for w in negative_waveforms:
-            for _ in range(num_aug):
-                wf = w
-                if self.augment:
-                    wf = self.pipeline.augment_audio(wf)
-                img, y = self._waveform_to_image(wf, label=0.0)
-                self.images.append(img)
-                self.labels.append(y)
-
-        # Sanity: keep everything aligned.
-        if len(self.images) != len(self.labels):
-            raise RuntimeError("Internal dataset build error: images/labels length mismatch.")
+            self._waveforms.append(w)
+            self.labels.append(torch.tensor([0.0], dtype=torch.float32))
 
     def __len__(self) -> int:
-        return len(self.images)
+        num_aug = AUG_FACTOR if self.augment else 1
+        return len(self._waveforms) * num_aug
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.images[idx], self.labels[idx]
+        raw_idx = idx % len(self._waveforms)
+        wf = self._waveforms[raw_idx]
+        label = self.labels[raw_idx]
+
+        if self.augment:
+            wf = self.pipeline.augment_audio(wf)
+
+        mel_db = waveform_to_mel(wf, self.mel_transform)
+        if self.augment:
+            mel_db = self.pipeline.augment_spectrogram(mel_db)
+        img = mel_to_image(mel_db, image_size=224)
+        return img, label
 
 
 def _audio_extensions() -> Tuple[str, ...]:
@@ -251,36 +240,41 @@ def create_dataloaders(positive_dir: str, negative_dir: Optional[str] = None, se
         seed=seed,
     )
 
-    # Stratified split based on label (sklearn optional)
-    y = torch.stack(dataset.labels).squeeze(1).numpy()
-    indices = list(range(len(dataset)))
+    # Stratified split on raw waveform indices, then expand to virtual (augmented) indices.
+    num_raw = len(dataset._waveforms)
+    y_raw = torch.stack(dataset.labels).squeeze(1).numpy()  # shape: (num_raw,)
+    raw_indices = list(range(num_raw))
+    num_aug = AUG_FACTOR
 
     try:
         from sklearn.model_selection import train_test_split
 
-        train_idx, val_idx = train_test_split(
-            indices,
+        train_raw, val_raw = train_test_split(
+            raw_indices,
             test_size=float(VAL_SPLIT),
             random_state=seed,
-            stratify=y,
+            stratify=y_raw,
         )
     except Exception:
-        # Fallback stratified split without sklearn.
         rng = random.Random(seed)
-        pos_idx = [i for i in indices if int(y[i]) == 1]
-        neg_idx = [i for i in indices if int(y[i]) == 0]
-        rng.shuffle(pos_idx)
-        rng.shuffle(neg_idx)
-        val_pos = max(1, int(round(len(pos_idx) * float(VAL_SPLIT))))
-        val_neg = max(1, int(round(len(neg_idx) * float(VAL_SPLIT))))
-        val_idx = pos_idx[:val_pos] + neg_idx[:val_neg]
-        train_idx = [i for i in indices if i not in set(val_idx)]
+        pos_raw = [i for i in raw_indices if int(y_raw[i]) == 1]
+        neg_raw = [i for i in raw_indices if int(y_raw[i]) == 0]
+        rng.shuffle(pos_raw)
+        rng.shuffle(neg_raw)
+        val_pos = max(1, int(round(len(pos_raw) * float(VAL_SPLIT))))
+        val_neg = max(1, int(round(len(neg_raw) * float(VAL_SPLIT))))
+        val_raw = pos_raw[:val_pos] + neg_raw[:val_neg]
+        train_raw = [i for i in raw_indices if i not in set(val_raw)]
 
-    # Guard: ensure both splits have at least 2 samples.
-    if len(val_idx) < 2 or len(train_idx) < 2:
-        mid = len(indices) // 2
-        train_idx = indices[:mid]
-        val_idx = indices[mid:]
+    # Guard: ensure both splits have at least 1 raw sample.
+    if len(val_raw) == 0 or len(train_raw) == 0:
+        mid = max(1, num_raw // 2)
+        train_raw = raw_indices[:mid]
+        val_raw = raw_indices[mid:] or raw_indices[-1:]
+
+    # Expand raw indices to all virtual (aug slot) indices.
+    train_idx = [r * num_aug + a for r in train_raw for a in range(num_aug)]
+    val_idx = [r * num_aug + a for r in val_raw for a in range(num_aug)]
 
     train_subset = torch.utils.data.Subset(dataset, train_idx)
     val_subset = torch.utils.data.Subset(dataset, val_idx)
