@@ -197,7 +197,13 @@ def create_app(backbone_ckpt: Optional[str] = None):
                         seed=1234,
                     )
 
-                    yield emit(f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}"), None
+                    n_train = len(train_loader.dataset)
+                    n_val = len(val_loader.dataset)
+                    yield emit(
+                        f"Dataset: {n_train} train samples, {n_val} val samples "
+                        f"({n_train + n_val} total incl. augmentation) | "
+                        f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}"
+                    ), None
                     yield emit("Building model..."), None
 
                     model = build_model(pretrained=True, num_classes=1)

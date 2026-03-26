@@ -20,19 +20,16 @@ _NEW_AMP = hasattr(_torch_amp, "GradScaler")
 
 from command_classifier.config import (
     BATCH_SIZE,
-    EARLY_STOPPING_PATIENCE,
     GRAD_CLIP_NORM,
     LR,
     NUM_EPOCHS,
     POS_WEIGHT,
     SCHEDULER,
-    VAL_SPLIT,
     WEIGHT_DECAY,
-    FREEZE_BACKBONE_EPOCHS,
     UNFREEZE_LR_FACTOR,
     CONFIDENCE_THRESHOLD,
 )
-from command_classifier.model.classifier import get_param_groups, freeze_backbone, unfreeze_backbone, _unwrap
+from command_classifier.model.classifier import get_param_groups, freeze_backbone, _unwrap
 
 
 def _try_import_sklearn_metrics():
@@ -79,7 +76,7 @@ class CNNTrainer:
         self,
         model: nn.Module,
         train_loader: torch.utils.data.DataLoader,
-        val_loader: torch.utils.data.DataLoader,
+        val_loader: Optional[torch.utils.data.DataLoader],
         device: Optional[torch.device] = None,
         checkpoint_dir: Optional[Path] = None,
         initial_epoch: int = 0,
@@ -254,10 +251,6 @@ class CNNTrainer:
         device = self.device
         epochs = int(NUM_EPOCHS)
 
-        # Freeze phase
-        freeze_epochs = min(int(FREEZE_BACKBONE_EPOCHS), epochs)
-        remaining_epochs = max(0, epochs - freeze_epochs)
-
         global_step = 0
         best_metrics: Dict[str, Any] = {}
 
@@ -280,119 +273,34 @@ class CNNTrainer:
                 pct_start=0.3,
             )
 
-        scheduler = make_scheduler(freeze_epochs)
+        scheduler = make_scheduler(epochs)
 
-        patience_counter = 0
-
-        for epoch in range(self.initial_epoch, freeze_epochs):
+        # Backbone stays frozen for the entire training — pretrained on SPEECHCOMMANDS,
+        # so features are already audio-adapted. Only the classifier head trains.
+        scheduler = make_scheduler(epochs)
+        for epoch in range(self.initial_epoch, epochs):
             start = time.time()
-            train_loss, _ = self._run_one_epoch(train=True, scheduler=scheduler)
-            val_loss, val_metrics = self._run_one_epoch(train=False, scheduler=None)
+            train_loss, train_metrics = self._run_one_epoch(train=True, scheduler=scheduler)
             elapsed = time.time() - start
 
             self.history["train_loss"].append(float(train_loss))
-            self.history["val_loss"].append(float(val_loss))
-            self.history["val_accuracy"].append(val_metrics["accuracy"])
-            self.history["val_precision"].append(val_metrics["precision"])
-            self.history["val_recall"].append(val_metrics["recall"])
-            self.history["val_f1"].append(val_metrics["f1"])
-            self.history["val_auc"].append(val_metrics["auc"])
-
-            is_best = val_loss < self.best_val_loss
-            if is_best:
-                self.best_val_loss = float(val_loss)
-                patience_counter = 0
-                best_metrics = val_metrics
-                ckpt_path = self.checkpoint_dir / f"best_epoch_{epoch:03d}.pt"
-                self._save_checkpoint(ckpt_path, epoch=epoch, metrics=val_metrics)
-                self.best_path = ckpt_path
-            else:
-                patience_counter += 1
 
             _log(
-                f"[frozen] epoch {epoch+1}/{epochs} | "
-                f"loss {train_loss:.4f} → val {val_loss:.4f} | "
-                f"f1 {val_metrics['f1']:.3f} | "
+                f"epoch {epoch+1}/{epochs} | "
+                f"loss {train_loss:.4f} | "
+                f"f1 {train_metrics['f1']:.3f} | "
                 f"{elapsed:.1f}s"
-                + (" ★" if is_best else f"  (patience {patience_counter}/{EARLY_STOPPING_PATIENCE})")
             )
 
-            if patience_counter >= int(EARLY_STOPPING_PATIENCE):
-                _log("Early stopping triggered.")
-                break
-
-        # Unfreeze phase
-        if remaining_epochs > 0:
-            unfreeze_backbone(self.model)
-            _log("Backbone unfrozen — fine-tuning all layers.")
-            scheduler = make_scheduler(remaining_epochs)
-            for i in range(remaining_epochs):
-                epoch = freeze_epochs + i
-                start = time.time()
-                train_loss, _ = self._run_one_epoch(train=True, scheduler=scheduler)
-                val_loss, val_metrics = self._run_one_epoch(train=False, scheduler=None)
-                elapsed = time.time() - start
-
-                self.history["train_loss"].append(float(train_loss))
-                self.history["val_loss"].append(float(val_loss))
-                self.history["val_accuracy"].append(val_metrics["accuracy"])
-                self.history["val_precision"].append(val_metrics["precision"])
-                self.history["val_recall"].append(val_metrics["recall"])
-                self.history["val_f1"].append(val_metrics["f1"])
-                self.history["val_auc"].append(val_metrics["auc"])
-
-                is_best = val_loss < self.best_val_loss
-                if is_best:
-                    self.best_val_loss = float(val_loss)
-                    patience_counter = 0
-                    best_metrics = val_metrics
-                    ckpt_path = self.checkpoint_dir / f"best_epoch_{epoch:03d}.pt"
-                    self._save_checkpoint(ckpt_path, epoch=epoch, metrics=val_metrics)
-                    self.best_path = ckpt_path
-                else:
-                    patience_counter += 1
-
-                _log(
-                    f"[tuning] epoch {epoch+1}/{epochs} | "
-                    f"loss {train_loss:.4f} → val {val_loss:.4f} | "
-                    f"f1 {val_metrics['f1']:.3f} | "
-                    f"{elapsed:.1f}s"
-                    + (" ★" if is_best else f"  (patience {patience_counter}/{EARLY_STOPPING_PATIENCE})")
-                )
-
-                if patience_counter >= int(EARLY_STOPPING_PATIENCE):
-                    _log("Early stopping triggered.")
-                    break
-
-        # Final best threshold (optional)
-        if self.best_path is not None:
-            # Load best checkpoint weights into model
-            payload = torch.load(str(self.best_path), map_location=self.device)
-            _unwrap(self.model).load_state_dict(payload["model_state"])
-
-        # Compute optimal threshold on val set.
-        # Collect all probs from val set quickly.
-        self.model.eval()
-        all_probs: List[float] = []
-        all_labels: List[int] = []
-        with torch.no_grad():
-            for images, labels in self.val_loader:
-                images = images.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True).float()
-                logits = self.model(images).view(-1)
-                probs = torch.sigmoid(logits).float().cpu().numpy()
-                all_probs.extend(probs.tolist())
-                all_labels.extend(labels.view(-1).float().cpu().numpy().tolist())
-
-        probs_np = np.array(all_probs, dtype=np.float32)
-        labels_np = np.array(all_labels, dtype=np.int64)
-        opt_t = self._optimal_threshold(probs_np, labels_np)
-        self.confidence_threshold = opt_t
+        # Save final checkpoint (no best-val-loss selection needed).
+        ckpt_path = self.checkpoint_dir / f"best_epoch_{epochs-1:03d}.pt"
+        self._save_checkpoint(ckpt_path, epoch=epochs - 1, metrics={"train_loss": train_loss})
+        self.best_path = ckpt_path
+        best_metrics = {"train_loss": train_loss}
 
         return {
-            "best_val_loss": self.best_val_loss,
-            "best_path": str(self.best_path) if self.best_path is not None else None,
+            "best_path": str(self.best_path),
             "best_metrics": best_metrics,
-            "optimal_threshold": opt_t,
+            "optimal_threshold": float(CONFIDENCE_THRESHOLD),
         }
 

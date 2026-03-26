@@ -50,11 +50,15 @@ class CommandDataset(Dataset):
         self.pipeline = AugmentationPipeline()
         self.mel_transform = create_mel_transform()
 
-        # Raw waveforms loaded once at init; augmentation happens lazily in __getitem__.
         self._waveforms: List[torch.Tensor] = []
         self.labels: List[torch.Tensor] = []
 
         self._load_waveforms()
+
+        # Pre-compute all augmented mel images once and cache in memory.
+        # Cost: ~17 MB for 30 samples — negligible. Eliminates per-epoch mel recomputation.
+        self._cache: List[torch.Tensor] = []  # length = num_raw * AUG_FACTOR
+        self._build_cache()
 
     @staticmethod
     def _collect_paths(directory: Path, extensions: Iterable[str]) -> List[Path]:
@@ -177,22 +181,27 @@ class CommandDataset(Dataset):
             self._waveforms.append(w)
             self.labels.append(torch.tensor([0.0], dtype=torch.float32))
 
-    def __len__(self) -> int:
+    def _build_cache(self) -> None:
+        """Pre-compute augmented mel spectrograms and cache in RAM.
+
+        Audio augmentation + FFT mel conversion (the expensive part) happens once here.
+        SpecAugment + mel_to_image remain on-the-fly in __getitem__ — both are fast tensor ops.
+        """
         num_aug = AUG_FACTOR if self.augment else 1
-        return len(self._waveforms) * num_aug
+        for wf in self._waveforms:
+            for _ in range(num_aug):
+                wf_aug = self.pipeline.augment_audio(wf) if self.augment else wf
+                self._cache.append(waveform_to_mel(wf_aug, self.mel_transform))
+
+    def __len__(self) -> int:
+        return len(self._cache)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        raw_idx = idx % len(self._waveforms)
-        wf = self._waveforms[raw_idx]
-        label = self.labels[raw_idx]
-
-        if self.augment:
-            wf = self.pipeline.augment_audio(wf)
-
-        mel_db = waveform_to_mel(wf, self.mel_transform)
+        mel_db = self._cache[idx]
         if self.augment:
             mel_db = self.pipeline.augment_spectrogram(mel_db)
         img = mel_to_image(mel_db, image_size=224)
+        label = self.labels[idx // (AUG_FACTOR if self.augment else 1)]
         return img, label
 
 
@@ -240,59 +249,20 @@ def create_dataloaders(positive_dir: str, negative_dir: Optional[str] = None, se
         seed=seed,
     )
 
-    # Stratified split on raw waveform indices, then expand to virtual (augmented) indices.
+    # Use ALL samples for training — no val split.
+    # With few-shot data every sample is precious; val metrics on 1-2 raw clips are meaningless.
     num_raw = len(dataset._waveforms)
     y_raw = torch.stack(dataset.labels).squeeze(1).numpy()  # shape: (num_raw,)
-    raw_indices = list(range(num_raw))
     num_aug = AUG_FACTOR
 
-    try:
-        from sklearn.model_selection import train_test_split
+    all_idx = [r * num_aug + a for r in range(num_raw) for a in range(num_aug)]
+    train_subset = torch.utils.data.Subset(dataset, all_idx)
 
-        train_raw, val_raw = train_test_split(
-            raw_indices,
-            test_size=float(VAL_SPLIT),
-            random_state=seed,
-            stratify=y_raw,
-        )
-    except Exception:
-        rng = random.Random(seed)
-        pos_raw = [i for i in raw_indices if int(y_raw[i]) == 1]
-        neg_raw = [i for i in raw_indices if int(y_raw[i]) == 0]
-        rng.shuffle(pos_raw)
-        rng.shuffle(neg_raw)
-        val_pos = max(1, int(round(len(pos_raw) * float(VAL_SPLIT))))
-        val_neg = max(1, int(round(len(neg_raw) * float(VAL_SPLIT))))
-        val_raw = pos_raw[:val_pos] + neg_raw[:val_neg]
-        train_raw = [i for i in raw_indices if i not in set(val_raw)]
-
-    # Guard: ensure both splits have at least 1 raw sample.
-    if len(val_raw) == 0 or len(train_raw) == 0:
-        mid = max(1, num_raw // 2)
-        train_raw = raw_indices[:mid]
-        val_raw = raw_indices[mid:] or raw_indices[-1:]
-
-    # Expand raw indices to all virtual (aug slot) indices.
-    train_idx = [r * num_aug + a for r in train_raw for a in range(num_aug)]
-    val_idx = [r * num_aug + a for r in val_raw for a in range(num_aug)]
-
-    train_subset = torch.utils.data.Subset(dataset, train_idx)
-    val_subset = torch.utils.data.Subset(dataset, val_idx)
-
-    # Few-shot friendly settings: no sample dropping, no multiprocessing overhead.
     effective_batch = min(BATCH_SIZE, max(1, len(train_subset)))
     train_loader = DataLoader(
         train_subset,
         batch_size=effective_batch,
         shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=min(BATCH_SIZE, max(1, len(val_subset))),
-        shuffle=False,
         num_workers=0,
         pin_memory=False,
         drop_last=False,
@@ -304,5 +274,5 @@ def create_dataloaders(positive_dir: str, negative_dir: Optional[str] = None, se
     pos_weight = float(num_neg) / float(max(1, num_pos))
 
     class_weights = {"pos_weight": pos_weight, "num_pos": num_pos, "num_neg": num_neg}
-    return train_loader, val_loader, class_weights
+    return train_loader, None, class_weights
 

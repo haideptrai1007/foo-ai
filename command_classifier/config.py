@@ -35,7 +35,7 @@ MEL_NORM: Final[str] = "slaney"
 # ----------------------------
 # Augmentation
 # ----------------------------
-AUG_FACTOR: Final[int] = 20
+AUG_FACTOR: Final[int] = 10
 NOISE_SNR_RANGE: Final[Tuple[float, float]] = (5.0, 30.0)  # dB
 PITCH_SHIFT_RANGE: Final[Tuple[float, float]] = (-2.0, 2.0)  # semitones
 TIME_STRETCH_RANGE: Final[Tuple[float, float]] = (0.85, 1.15)
