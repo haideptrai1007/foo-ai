@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import queue
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -204,22 +206,45 @@ def create_app(backbone_ckpt: Optional[str] = None):
 
                     yield emit("Starting training..."), None
 
-                    # Temporarily override NUM_EPOCHS via a monkey-patch-safe approach
                     import command_classifier.training.trainer as _trainer_mod
                     _orig = _trainer_mod.NUM_EPOCHS
                     _trainer_mod.NUM_EPOCHS = int(epochs)
 
-                    try:
-                        trainer = CNNTrainer(
-                            model=model,
-                            train_loader=train_loader,
-                            val_loader=val_loader,
-                            device=None,
-                            checkpoint_dir=Path(ckpt_dir),
-                        )
-                        metrics = trainer.train()
-                    finally:
-                        _trainer_mod.NUM_EPOCHS = _orig
+                    log_q: queue.Queue = queue.Queue()
+                    result_box: List[Any] = [None, None]  # [metrics, exception]
+
+                    def _run_training():
+                        try:
+                            t = CNNTrainer(
+                                model=model,
+                                train_loader=train_loader,
+                                val_loader=val_loader,
+                                device=None,
+                                checkpoint_dir=Path(ckpt_dir),
+                            )
+                            result_box[0] = t.train(log_fn=log_q.put)
+                        except Exception as exc:
+                            result_box[1] = exc
+                        finally:
+                            _trainer_mod.NUM_EPOCHS = _orig
+                            log_q.put(None)  # sentinel
+
+                    thread = threading.Thread(target=_run_training, daemon=True)
+                    thread.start()
+
+                    while True:
+                        msg = log_q.get()
+                        if msg is None:
+                            break
+                        yield emit(msg), None
+
+                    thread.join()
+
+                    if result_box[1] is not None:
+                        yield emit(f"Error: {result_box[1]}"), None
+                        return
+
+                    metrics = result_box[0]
 
                 yield emit("Training complete."), metrics
 

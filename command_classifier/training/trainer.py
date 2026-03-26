@@ -240,10 +240,16 @@ class CNNTrainer:
         }
         torch.save(payload, str(path))
 
-    def train(self) -> Dict[str, Any]:
+    def train(self, log_fn=None) -> Dict[str, Any]:
         """
         Train for NUM_EPOCHS with frozen backbone first, then unfreeze and fine-tune.
+
+        log_fn: optional callable(str) called after every epoch with a status line.
         """
+
+        def _log(msg: str) -> None:
+            if log_fn is not None:
+                log_fn(msg)
 
         device = self.device
         epochs = int(NUM_EPOCHS)
@@ -282,6 +288,7 @@ class CNNTrainer:
             start = time.time()
             train_loss, _ = self._run_one_epoch(train=True, scheduler=scheduler)
             val_loss, val_metrics = self._run_one_epoch(train=False, scheduler=None)
+            elapsed = time.time() - start
 
             self.history["train_loss"].append(float(train_loss))
             self.history["val_loss"].append(float(val_loss))
@@ -291,7 +298,8 @@ class CNNTrainer:
             self.history["val_f1"].append(val_metrics["f1"])
             self.history["val_auc"].append(val_metrics["auc"])
 
-            if val_loss < self.best_val_loss:
+            is_best = val_loss < self.best_val_loss
+            if is_best:
                 self.best_val_loss = float(val_loss)
                 patience_counter = 0
                 best_metrics = val_metrics
@@ -301,19 +309,29 @@ class CNNTrainer:
             else:
                 patience_counter += 1
 
-            if patience_counter >= int(EARLY_STOPPING_PATIENCE):
-                break
+            _log(
+                f"[frozen] epoch {epoch+1}/{epochs} | "
+                f"loss {train_loss:.4f} → val {val_loss:.4f} | "
+                f"f1 {val_metrics['f1']:.3f} | "
+                f"{elapsed:.1f}s"
+                + (" ★" if is_best else f"  (patience {patience_counter}/{EARLY_STOPPING_PATIENCE})")
+            )
 
-            _ = start  # placeholder for future logging
+            if patience_counter >= int(EARLY_STOPPING_PATIENCE):
+                _log("Early stopping triggered.")
+                break
 
         # Unfreeze phase
         if remaining_epochs > 0:
             unfreeze_backbone(self.model)
+            _log("Backbone unfrozen — fine-tuning all layers.")
             scheduler = make_scheduler(remaining_epochs)
             for i in range(remaining_epochs):
                 epoch = freeze_epochs + i
+                start = time.time()
                 train_loss, _ = self._run_one_epoch(train=True, scheduler=scheduler)
                 val_loss, val_metrics = self._run_one_epoch(train=False, scheduler=None)
+                elapsed = time.time() - start
 
                 self.history["train_loss"].append(float(train_loss))
                 self.history["val_loss"].append(float(val_loss))
@@ -323,7 +341,8 @@ class CNNTrainer:
                 self.history["val_f1"].append(val_metrics["f1"])
                 self.history["val_auc"].append(val_metrics["auc"])
 
-                if val_loss < self.best_val_loss:
+                is_best = val_loss < self.best_val_loss
+                if is_best:
                     self.best_val_loss = float(val_loss)
                     patience_counter = 0
                     best_metrics = val_metrics
@@ -333,7 +352,16 @@ class CNNTrainer:
                 else:
                     patience_counter += 1
 
+                _log(
+                    f"[tuning] epoch {epoch+1}/{epochs} | "
+                    f"loss {train_loss:.4f} → val {val_loss:.4f} | "
+                    f"f1 {val_metrics['f1']:.3f} | "
+                    f"{elapsed:.1f}s"
+                    + (" ★" if is_best else f"  (patience {patience_counter}/{EARLY_STOPPING_PATIENCE})")
+                )
+
                 if patience_counter >= int(EARLY_STOPPING_PATIENCE):
+                    _log("Early stopping triggered.")
                     break
 
         # Final best threshold (optional)
