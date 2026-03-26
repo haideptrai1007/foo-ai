@@ -271,28 +271,36 @@ def create_dataloaders(positive_dir: str, negative_dir: Optional[str] = None, se
         neg_idx = [i for i in indices if int(y[i]) == 0]
         rng.shuffle(pos_idx)
         rng.shuffle(neg_idx)
-        val_pos = int(round(len(pos_idx) * float(VAL_SPLIT)))
-        val_neg = int(round(len(neg_idx) * float(VAL_SPLIT)))
+        val_pos = max(1, int(round(len(pos_idx) * float(VAL_SPLIT))))
+        val_neg = max(1, int(round(len(neg_idx) * float(VAL_SPLIT))))
         val_idx = pos_idx[:val_pos] + neg_idx[:val_neg]
         train_idx = [i for i in indices if i not in set(val_idx)]
+
+    # Guard: ensure both splits have at least 2 samples.
+    if len(val_idx) < 2 or len(train_idx) < 2:
+        mid = len(indices) // 2
+        train_idx = indices[:mid]
+        val_idx = indices[mid:]
 
     train_subset = torch.utils.data.Subset(dataset, train_idx)
     val_subset = torch.utils.data.Subset(dataset, val_idx)
 
+    # Few-shot friendly settings: no sample dropping, no multiprocessing overhead.
+    effective_batch = min(BATCH_SIZE, max(1, len(train_subset)))
     train_loader = DataLoader(
         train_subset,
-        batch_size=BATCH_SIZE,
+        batch_size=effective_batch,
         shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-        drop_last=True,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
     )
     val_loader = DataLoader(
         val_subset,
-        batch_size=BATCH_SIZE,
+        batch_size=min(BATCH_SIZE, max(1, len(val_subset))),
         shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=False,
         drop_last=False,
     )
 

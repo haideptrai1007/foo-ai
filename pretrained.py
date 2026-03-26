@@ -167,7 +167,7 @@ class SpeechCommandsMelDataset(Dataset):
         if sr != SAMPLE_RATE:
             import torchaudio
 
-            waveform = torchaudio.transforms.Resample(orig_sr=sr, new_sr=SAMPLE_RATE)(waveform)
+            waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)(waveform)
 
         waveform = pad_or_truncate(waveform, AUDIO_SAMPLES, mode="center")
         waveform = normalize_waveform(waveform)

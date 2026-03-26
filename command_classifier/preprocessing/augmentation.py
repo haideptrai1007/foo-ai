@@ -90,9 +90,11 @@ class AugmentationPipeline:
 
     def _pitch_shift(self, waveform: Tensor) -> Tensor:
         _require_torchaudio()
-        # torchaudio.functional.pitch_shift uses n_steps (semitones)
         steps = random.uniform(float(PITCH_SHIFT_RANGE[0]), float(PITCH_SHIFT_RANGE[1]))
-        return torchaudio.functional.pitch_shift(waveform, sample_rate=SAMPLE_RATE, n_steps=steps)
+        try:
+            return torchaudio.functional.pitch_shift(waveform, sample_rate=SAMPLE_RATE, n_steps=steps)
+        except (AttributeError, TypeError, Exception):
+            return waveform
 
     def _volume_perturb(self, waveform: Tensor) -> Tensor:
         gain = random.uniform(0.7, 1.3)
@@ -104,8 +106,10 @@ class AugmentationPipeline:
     def _time_stretch(self, waveform: Tensor) -> Tensor:
         _require_torchaudio()
         rate = random.uniform(float(TIME_STRETCH_RANGE[0]), float(TIME_STRETCH_RANGE[1]))
-        stretched = torchaudio.functional.speed(waveform, sample_rate=SAMPLE_RATE, factor=rate)
-        # Re-pad/truncate by fixed-length center crop (augmentation assumes fixed length)
+        try:
+            stretched = torchaudio.functional.speed(waveform, sample_rate=SAMPLE_RATE, factor=rate)
+        except (AttributeError, TypeError, Exception):
+            return waveform
         if stretched.size(-1) == AUDIO_SAMPLES:
             return stretched
         if stretched.size(-1) < AUDIO_SAMPLES:

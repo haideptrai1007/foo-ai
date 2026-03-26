@@ -72,34 +72,41 @@ def create_app(backbone_ckpt: Optional[str] = None):
 
             counter_display = gr.Textbox(
                 label="Recorded so far",
-                value="Positive: 0   Negative: 0",
+                value="Positive: 0/10   Negative: 0/10",
                 interactive=False,
             )
 
-            def _counter_text(state):
-                return f"Positive: {len(state['positive'])}   Negative: {len(state['negative'])}"
+            def _counter_text(state, target):
+                n = int(target)
+                pos = len(state["positive"])
+                neg = len(state["negative"])
+                return f"Positive: {pos}/{n}   Negative: {neg}/{n}"
 
-            def save_positive(audio, state):
+            def save_positive(audio, state, target):
                 if audio is None:
-                    return state, _counter_text(state)
+                    return state, _counter_text(state, target)
+                if len(state["positive"]) >= int(target):
+                    return state, _counter_text(state, target)
                 sr, arr = audio
                 state["positive"].append((sr, arr.copy()))
-                return state, _counter_text(state)
+                return state, _counter_text(state, target)
 
-            def save_negative(audio, state):
+            def save_negative(audio, state, target):
                 if audio is None:
-                    return state, _counter_text(state)
+                    return state, _counter_text(state, target)
+                if len(state["negative"]) >= int(target):
+                    return state, _counter_text(state, target)
                 sr, arr = audio
                 state["negative"].append((sr, arr.copy()))
-                return state, _counter_text(state)
+                return state, _counter_text(state, target)
 
-            def clear_all(_state):
+            def clear_all(_state, target):
                 new_state = {"positive": [], "negative": []}
-                return new_state, _counter_text(new_state)
+                return new_state, _counter_text(new_state, target)
 
-            btn_pos.click(fn=save_positive, inputs=[mic_audio, clips_state], outputs=[clips_state, counter_display])
-            btn_neg.click(fn=save_negative, inputs=[mic_audio, clips_state], outputs=[clips_state, counter_display])
-            btn_clear.click(fn=clear_all, inputs=[clips_state], outputs=[clips_state, counter_display])
+            btn_pos.click(fn=save_positive, inputs=[mic_audio, clips_state, n_samples], outputs=[clips_state, counter_display])
+            btn_neg.click(fn=save_negative, inputs=[mic_audio, clips_state, n_samples], outputs=[clips_state, counter_display])
+            btn_clear.click(fn=clear_all, inputs=[clips_state, n_samples], outputs=[clips_state, counter_display])
 
         # ── Tab 2: Train ─────────────────────────────────────────────────────
         with gr.Tab("2 · Train"):

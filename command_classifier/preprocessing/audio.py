@@ -33,8 +33,7 @@ def _get_resampler(orig_sr: int, target_sr: int, dtype: torch.dtype) -> "torchau
     """
 
     _require_torchaudio()
-    resampler = torchaudio.transforms.Resample(orig_sr=orig_sr, new_sr=target_sr)
-    # Keep weights/buffers in the same dtype for fewer surprises.
+    resampler = torchaudio.transforms.Resample(orig_freq=orig_sr, new_freq=target_sr)
     return cast("torchaudio.transforms.Resample", resampler.to(dtype=dtype))
 
 
