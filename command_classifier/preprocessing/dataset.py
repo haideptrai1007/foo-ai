@@ -299,8 +299,8 @@ def create_dataloaders(positive_dir: str, negative_dir: Optional[str] = None, se
     )
 
     # For BCEWithLogitsLoss, often `pos_weight = num_neg/num_pos`.
-    num_pos = int((y == 1).sum())
-    num_neg = int((y == 0).sum())
+    num_pos = int((y_raw == 1).sum())
+    num_neg = int((y_raw == 0).sum())
     pos_weight = float(num_neg) / float(max(1, num_pos))
 
     class_weights = {"pos_weight": pos_weight, "num_pos": num_pos, "num_neg": num_neg}
