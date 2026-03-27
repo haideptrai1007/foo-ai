@@ -69,7 +69,7 @@ UNFREEZE_LR_FACTOR: Final[float] = 0.1
 
 BATCH_SIZE: Final[int] = 64
 NUM_EPOCHS: Final[int] = 40
-LR: Final[float] = 3e-4
+LR: Final[float] = 1e-4
 WEIGHT_DECAY: Final[float] = 1e-4
 LABEL_SMOOTHING: Final[float] = 0.05
 POS_WEIGHT: Final[float] = 1.0
