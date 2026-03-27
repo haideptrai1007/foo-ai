@@ -29,7 +29,7 @@ from command_classifier.config import (
     UNFREEZE_LR_FACTOR,
     CONFIDENCE_THRESHOLD,
 )
-from command_classifier.model.classifier import get_param_groups, freeze_backbone, _unwrap
+from command_classifier.model.classifier import get_param_groups, freeze_backbone, unfreeze_backbone, _unwrap
 
 
 def _try_import_sklearn_metrics():
@@ -80,11 +80,13 @@ class CNNTrainer:
         device: Optional[torch.device] = None,
         checkpoint_dir: Optional[Path] = None,
         initial_epoch: int = 0,
+        freeze_epochs: Optional[int] = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.initial_epoch = initial_epoch
+        self.freeze_epochs = freeze_epochs
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -272,14 +274,23 @@ class CNNTrainer:
                 pct_start=0.3,
             )
 
-        # Backbone stays frozen for the entire training — pretrained on SPEECHCOMMANDS,
-        # so features are already audio-adapted. Only the classifier head trains.
+        # Phase 1: frozen backbone. Phase 2: unfrozen fine-tune (if freeze_epochs set).
+        freeze_epochs = self.freeze_epochs if self.freeze_epochs is not None else epochs
+        unfreeze_epoch = freeze_epochs  # epoch index at which backbone is unfrozen
+
         scheduler = make_scheduler(epochs)
         train_loss = 0.0
         best_metrics: Dict[str, Any] = {}
         last_probs: np.ndarray = np.array([], dtype=np.float32)
         last_labels: np.ndarray = np.array([], dtype=np.int64)
         for epoch in range(self.initial_epoch, epochs):
+            if epoch == unfreeze_epoch and unfreeze_epoch < epochs:
+                _log(f"--- Unfreezing backbone at epoch {epoch+1} ---")
+                unfreeze_backbone(self.model)
+                # Rebuild scheduler for the remaining unfreeze phase
+                remaining = epochs - epoch
+                scheduler = make_scheduler(remaining)
+
             start = time.time()
             train_loss, train_metrics, last_probs, last_labels = self._run_one_epoch(train=True, scheduler=scheduler)
             elapsed = time.time() - start

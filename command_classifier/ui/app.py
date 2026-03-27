@@ -147,7 +147,8 @@ def create_app(backbone_ckpt: Optional[str] = None):
             gr.Markdown("Train the few-shot classifier on your recorded samples.")
 
             with gr.Row():
-                train_epochs = gr.Number(label="Epochs", value=20, precision=0)
+                freeze_epochs_input = gr.Number(label="Freeze backbone epochs", value=15, precision=0)
+                unfreeze_epochs_input = gr.Number(label="Unfreeze backbone epochs", value=5, precision=0)
                 ckpt_dir_box = gr.Textbox(label="Checkpoint output dir", value=str(CHECKPOINT_DIR))
 
             if backbone_ckpt:
@@ -159,7 +160,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
             train_log = gr.Textbox(label="Training log", lines=12, interactive=False)
             train_result = gr.JSON(label="Final metrics")
 
-            def on_train(state, epochs, ckpt_dir):
+            def on_train(state, freeze_epochs, unfreeze_epochs, ckpt_dir):
                 import torch
                 from command_classifier.config import NUM_EPOCHS
                 from command_classifier.model.classifier import build_model, prepare_model
@@ -217,7 +218,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
 
                     import command_classifier.training.trainer as _trainer_mod
                     _orig = _trainer_mod.NUM_EPOCHS
-                    _trainer_mod.NUM_EPOCHS = int(epochs)
+                    _trainer_mod.NUM_EPOCHS = int(freeze_epochs) + int(unfreeze_epochs)
 
                     log_q: queue.Queue = queue.Queue()
                     result_box: List[Any] = [None, None]  # [metrics, exception]
@@ -230,6 +231,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
                                 val_loader=val_loader,
                                 device=None,
                                 checkpoint_dir=Path(ckpt_dir),
+                                freeze_epochs=int(freeze_epochs),
                             )
                             result_box[0] = t.train(log_fn=log_q.put)
                         except Exception as exc:
@@ -259,7 +261,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
 
             train_click = train_btn.click(
                 fn=on_train,
-                inputs=[clips_state, train_epochs, ckpt_dir_box],
+                inputs=[clips_state, freeze_epochs_input, unfreeze_epochs_input, ckpt_dir_box],
                 outputs=[train_log, train_result],
             )
 
