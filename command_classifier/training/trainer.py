@@ -90,7 +90,7 @@ class CNNTrainer:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
-        self.checkpoint_dir = checkpoint_dir or Path("./checkpoints")
+        self.checkpoint_dir = checkpoint_dir or Path("./checkpoint")
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # BCEWithLogitsLoss expects pos_weight as a tensor.
@@ -252,7 +252,6 @@ class CNNTrainer:
         epochs = int(NUM_EPOCHS)
 
         global_step = 0
-        best_metrics: Dict[str, Any] = {}
 
         # Scheduler setup: keep per-batch OneCycleLR.
         def make_scheduler(num_epochs: int) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
@@ -277,6 +276,7 @@ class CNNTrainer:
         # so features are already audio-adapted. Only the classifier head trains.
         scheduler = make_scheduler(epochs)
         train_loss = 0.0
+        best_metrics: Dict[str, Any] = {}
         last_probs: np.ndarray = np.array([], dtype=np.float32)
         last_labels: np.ndarray = np.array([], dtype=np.int64)
         for epoch in range(self.initial_epoch, epochs):
@@ -286,6 +286,7 @@ class CNNTrainer:
 
             self.history["train_loss"].append(float(train_loss))
 
+            monitor_loss = train_loss
             if self.val_loader is not None:
                 val_loss, val_metrics, last_probs, last_labels = self._run_one_epoch(train=False)
                 self.history["val_loss"].append(float(val_loss))
@@ -294,6 +295,7 @@ class CNNTrainer:
                 self.history["val_recall"].append(val_metrics["recall"])
                 self.history["val_f1"].append(val_metrics["f1"])
                 self.history["val_auc"].append(val_metrics["auc"])
+                monitor_loss = val_loss
 
             _log(
                 f"epoch {epoch+1}/{epochs} | "
@@ -302,11 +304,12 @@ class CNNTrainer:
                 f"{elapsed:.1f}s"
             )
 
-        # Save final checkpoint (no best-val-loss selection needed).
-        ckpt_path = self.checkpoint_dir / f"best_epoch_{epochs-1:03d}.pt"
-        self._save_checkpoint(ckpt_path, epoch=epochs - 1, metrics={"train_loss": train_loss})
-        self.best_path = ckpt_path
-        best_metrics = {"train_loss": train_loss}
+            if not math.isnan(monitor_loss) and monitor_loss < self.best_val_loss:
+                self.best_val_loss = monitor_loss
+                ckpt_path = self.checkpoint_dir / "best.pt"
+                self._save_checkpoint(ckpt_path, epoch=epoch, metrics={"loss": monitor_loss})
+                self.best_path = ckpt_path
+                best_metrics = {"loss": monitor_loss}
 
         return {
             "best_path": str(self.best_path),

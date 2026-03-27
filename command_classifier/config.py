@@ -94,6 +94,6 @@ DATA_DIR: Final[Path] = BASE_DIR / "data"
 RAW_POSITIVE_DIR: Final[Path] = DATA_DIR / "positive"
 RAW_NEGATIVE_DIR: Final[Path] = DATA_DIR / "negative"
 AUGMENTED_DIR: Final[Path] = DATA_DIR / "augmented"
-CHECKPOINT_DIR: Final[Path] = BASE_DIR / "checkpoints"
+CHECKPOINT_DIR: Final[Path] = Path("checkpoint")
 EXPORT_DIR: Final[Path] = BASE_DIR / "export"
 
