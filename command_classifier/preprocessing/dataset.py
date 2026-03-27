@@ -20,7 +20,12 @@ from command_classifier.config import (
 )
 
 from command_classifier.preprocessing.audio import load_audio
-from command_classifier.preprocessing.augmentation import AugmentationPipeline
+from command_classifier.preprocessing.augmentation import (
+    AugmentationPipeline,
+    generate_crowd_noise,
+    generate_traffic_noise,
+    generate_horn_noise,
+)
 from command_classifier.preprocessing.mel import create_mel_transform, mel_to_image, waveform_to_mel
 
 
@@ -135,6 +140,12 @@ class CommandDataset(Dataset):
                 pink_rms = pink.pow(2).mean().sqrt().clamp(min=1e-8)
                 amp = random.uniform(0.05, 0.2)
                 w = pink / pink_rms * amp
+            elif src == "crowd_noise":
+                w = generate_crowd_noise(AUDIO_SAMPLES)
+            elif src == "traffic_noise":
+                w = generate_traffic_noise(AUDIO_SAMPLES)
+            elif src == "horn_noise":
+                w = generate_horn_noise(AUDIO_SAMPLES)
             elif src == "random_speech":
                 w = self._mutate_positive_for_negative(base_waveform)
             else:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 from typing import Tuple
@@ -49,6 +50,59 @@ def _probe_torchaudio_ops() -> Tuple[bool, bool]:
 _HAS_PITCH_SHIFT, _HAS_SPEED = _probe_torchaudio_ops()
 
 
+def generate_crowd_noise(n_samples: int, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
+    """Band-limited pink noise with slow AM — simulates crowd murmur."""
+    white = torch.randn(1, n_samples)
+    pink = torch.cumsum(white, dim=-1)
+    # Band-pass to speech range (300–3000 Hz) via FFT brick-wall
+    fft = torch.fft.rfft(pink, dim=-1)
+    freqs = torch.fft.rfftfreq(n_samples, d=1.0 / sample_rate)
+    fft = fft * ((freqs >= 300) & (freqs <= 3000)).float()
+    noise = torch.fft.irfft(fft, n=n_samples, dim=-1)
+    # Slow amplitude modulation (1–3 Hz) for crowd ebb/flow
+    t = torch.linspace(0, n_samples / sample_rate, n_samples)
+    mod = 0.7 + 0.3 * torch.sin(2 * math.pi * random.uniform(1.0, 3.0) * t)
+    noise = noise * mod.unsqueeze(0)
+    rms = noise.pow(2).mean().sqrt().clamp(min=1e-8)
+    return noise / rms * random.uniform(0.05, 0.3)
+
+
+def generate_traffic_noise(n_samples: int, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
+    """Low-freq filtered noise + engine harmonics — simulates vehicle rumble."""
+    white = torch.randn(1, n_samples)
+    fft = torch.fft.rfft(white, dim=-1)
+    freqs = torch.fft.rfftfreq(n_samples, d=1.0 / sample_rate)
+    fft = fft * (freqs <= 250).float()
+    noise = torch.fft.irfft(fft, n=n_samples, dim=-1)
+    # Periodic engine harmonics
+    t = torch.linspace(0, n_samples / sample_rate, n_samples)
+    fundamental = random.uniform(60.0, 120.0)
+    harmonics = sum((1.0 / k) * torch.sin(2 * math.pi * fundamental * k * t) for k in range(1, 5))
+    combined = noise + 0.3 * harmonics.unsqueeze(0)
+    rms = combined.pow(2).mean().sqrt().clamp(min=1e-8)
+    return combined / rms * random.uniform(0.05, 0.25)
+
+
+def generate_horn_noise(n_samples: int, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
+    """Short tonal burst(s) at ~400–500 Hz — simulates a car horn."""
+    t = torch.linspace(0, n_samples / sample_rate, n_samples)
+    fundamental = random.uniform(380.0, 520.0)
+    tone = torch.sin(2 * math.pi * fundamental * t) + 0.5 * torch.sin(2 * math.pi * 2 * fundamental * t)
+    tone = tone.unsqueeze(0)
+    # Envelope: 1–2 short honks
+    envelope = torch.zeros(n_samples)
+    total_s = n_samples / sample_rate
+    for _ in range(random.randint(1, 2)):
+        start_s = random.uniform(0.0, total_s * 0.5)
+        dur_s = random.uniform(0.1, 0.4)
+        s = int(start_s * sample_rate)
+        e = min(n_samples, int((start_s + dur_s) * sample_rate))
+        envelope[s:e] = 1.0
+    tone = tone * envelope.unsqueeze(0) + 0.05 * torch.randn_like(tone)
+    rms = tone.pow(2).mean().sqrt().clamp(min=1e-8)
+    return tone / rms * random.uniform(0.1, 0.4)
+
+
 def _require_torchaudio() -> None:
     if torchaudio is None:  # pragma: no cover
         raise ImportError("torchaudio is required for augmentation. Install torchaudio to use this module.")
@@ -86,6 +140,15 @@ class AugmentationPipeline:
         noise_scale = self._snr_to_noise_scale(waveform, snr_db)
         noise = torch.randn_like(waveform) * noise_scale
         return waveform + noise
+
+    def _add_ambient_noise(self, waveform: Tensor) -> Tensor:
+        """Mix one of crowd / traffic / horn noise into the waveform at a random SNR."""
+        gen = random.choice([generate_crowd_noise, generate_traffic_noise, generate_horn_noise])
+        noise = gen(waveform.size(-1)).to(waveform.device)
+        snr_db = random.uniform(float(NOISE_SNR_RANGE[0]), float(NOISE_SNR_RANGE[1]))
+        noise_scale = self._snr_to_noise_scale(waveform, snr_db)
+        noise_rms = noise.pow(2).mean().sqrt().clamp(min=1e-8)
+        return waveform + noise / noise_rms * noise_scale
 
     def _add_pink_noise(self, waveform: Tensor) -> Tensor:
         """
@@ -149,6 +212,7 @@ class AugmentationPipeline:
         ops = [
             self._add_gaussian_noise,
             self._add_pink_noise,
+            self._add_ambient_noise,
             self._time_shift,
             self._volume_perturb,
             self._polarity_invert,

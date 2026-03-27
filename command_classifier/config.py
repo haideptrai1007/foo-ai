@@ -54,6 +54,9 @@ NEG_SOURCES: Final[Tuple[str, ...]] = (
     "white_noise",
     "pink_noise",
     "random_speech",
+    "crowd_noise",
+    "traffic_noise",
+    "horn_noise",
 )
 
 # ----------------------------
