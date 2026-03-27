@@ -49,7 +49,7 @@ class CommandDataset(Dataset):
         self.seed = seed
 
         self.pipeline = AugmentationPipeline()
-        self.mel_transform = create_mel_transform()
+        self.mel_transform = create_mel_transform().to("cpu")
 
         self._waveforms: List[torch.Tensor] = []
         self.labels: List[torch.Tensor] = []
