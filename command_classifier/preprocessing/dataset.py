@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
+import os
 import random
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -62,9 +65,19 @@ class CommandDataset(Dataset):
 
         self._load_waveforms()
 
-        # Pre-compute all augmented mel images once and cache in memory.
-        # Cost: ~17 MB for 30 samples — negligible. Eliminates per-epoch mel recomputation.
-        self._cache: List[torch.Tensor] = []  # length = num_raw * AUG_FACTOR
+        # Dynamic aug factor: target 10–50 augmented samples per class.
+        # Scales with how many originals you have; never exceeds AUG_FACTOR cap.
+        if self.augment:
+            n_pos = sum(1 for l in self.labels if float(l) > 0.5)
+            n_neg = len(self.labels) - n_pos
+            n_min = max(1, min(n_pos, n_neg))
+            target = max(10, min(50, n_min * 3))
+            self.aug_factor: int = min(AUG_FACTOR, max(1, math.ceil(target / n_min)))
+        else:
+            self.aug_factor = 1
+
+        # Pre-compute augmented mel spectrograms in parallel — eliminates per-epoch cost.
+        self._cache: List[torch.Tensor] = []
         self._build_cache()
 
     @staticmethod
@@ -81,16 +94,15 @@ class CommandDataset(Dataset):
     def _mutate_positive_for_negative(self, waveform: torch.Tensor) -> torch.Tensor:
         """
         Synthesize "wrong command" negatives from positive waveform.
+        Choose one of 3 distinct mutation strategies.
         """
         # 3 mutation families, pick one randomly.
         choice = random.random()
         if choice < 0.33:
-            # Heavy pitch shift: approximated by using smaller torchaudio pitch shift
-            # but this requires torchaudio; we avoid that here by just time-reversing
-            # as a robust fallback.
-            return waveform.flip(-1)
-        if choice < 0.66:
-            # Chopped segments: concatenate shuffled segments
+            # Strategy 1: Time-reverse the waveform
+            out = waveform.flip(-1)
+        elif choice < 0.66:
+            # Strategy 2: Chop and shuffle segments
             n = waveform.size(-1)
             cut1 = int(n * random.uniform(0.2, 0.4))
             cut2 = int(n * random.uniform(0.6, 0.8))
@@ -101,7 +113,7 @@ class CommandDataset(Dataset):
             random.shuffle(segs)
             out = torch.cat(segs, dim=-1)
         else:
-            # Shuffled small windows
+            # Strategy 3: Shuffle small windows
             n = waveform.size(-1)
             num_windows = random.randint(3, 6)
             window = n // num_windows
@@ -205,16 +217,23 @@ class CommandDataset(Dataset):
             self.labels.append(torch.tensor([0.0], dtype=torch.float32))
 
     def _build_cache(self) -> None:
-        """Pre-compute augmented mel spectrograms and cache in RAM.
+        """Pre-compute augmented mel spectrograms in parallel and cache in RAM.
 
-        Audio augmentation + FFT mel conversion (the expensive part) happens once here.
+        Audio augmentation + FFT mel conversion happen once here across a thread pool.
         SpecAugment + mel_to_image remain on-the-fly in __getitem__ — both are fast tensor ops.
         """
-        num_aug = AUG_FACTOR if self.augment else 1
-        for wf in self._waveforms:
-            for _ in range(num_aug):
-                wf_aug = self.pipeline.augment_audio(wf) if self.augment else wf
-                self._cache.append(waveform_to_mel(wf_aug, self.mel_transform))
+        augment = self.augment
+        pipeline = self.pipeline
+        mel_transform = self.mel_transform
+
+        def _one(wf: torch.Tensor) -> torch.Tensor:
+            wf_aug = pipeline.augment_audio(wf) if augment else wf
+            return waveform_to_mel(wf_aug, mel_transform)
+
+        tasks = [wf for wf in self._waveforms for _ in range(self.aug_factor)]
+        workers = min(4, max(1, os.cpu_count() or 1))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            self._cache = list(ex.map(_one, tasks))
 
     def __len__(self) -> int:
         return len(self._cache)
@@ -224,7 +243,7 @@ class CommandDataset(Dataset):
         if self.augment:
             mel_db = self.pipeline.augment_spectrogram(mel_db)
         img = mel_to_image(mel_db, image_size=IMAGE_SIZE)
-        label = self.labels[idx // (AUG_FACTOR if self.augment else 1)]
+        label = self.labels[idx // self.aug_factor]
         return img, label
 
 
@@ -276,7 +295,7 @@ def create_dataloaders(positive_dir: str, negative_dir: Optional[str] = None, se
     # With few-shot data every sample is precious; val metrics on 1-2 raw clips are meaningless.
     num_raw = len(dataset._waveforms)
     y_raw = torch.stack(dataset.labels).squeeze(1).numpy()  # shape: (num_raw,)
-    num_aug = AUG_FACTOR
+    num_aug = dataset.aug_factor
 
     all_idx = [r * num_aug + a for r in range(num_raw) for a in range(num_aug)]
     train_subset = torch.utils.data.Subset(dataset, all_idx)
