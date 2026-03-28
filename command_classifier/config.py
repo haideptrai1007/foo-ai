@@ -53,7 +53,6 @@ NEG_SOURCES: Final[Tuple[str, ...]] = (
     "silence",
     "white_noise",
     "pink_noise",
-    "random_speech",
     "crowd_noise",
     "traffic_noise",
     "horn_noise",
@@ -97,6 +96,8 @@ DATA_DIR: Final[Path] = BASE_DIR / "data"
 RAW_POSITIVE_DIR: Final[Path] = DATA_DIR / "positive"
 RAW_NEGATIVE_DIR: Final[Path] = DATA_DIR / "negative"
 AUGMENTED_DIR: Final[Path] = DATA_DIR / "augmented"
+SPEECH_COMMANDS_SAMPLES_DIR: Final[Path] = DATA_DIR / "speech_commands_samples"
+SPEECH_COMMANDS_SAMPLES_PER_CLASS: Final[int] = 5
 CHECKPOINT_DIR: Final[Path] = Path("checkpoint")
 EXPORT_DIR: Final[Path] = BASE_DIR / "export"
 

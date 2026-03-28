@@ -15,6 +15,7 @@ from command_classifier.config import (
     NEG_RATIO,
     NEG_SOURCES,
     NUM_WORKERS,
+    SPEECH_COMMANDS_SAMPLES_DIR,
     VAL_SPLIT,
     BATCH_SIZE,
 )
@@ -184,6 +185,16 @@ class CommandDataset(Dataset):
                     negative_waveforms.append(load_audio(str(p)))
                 except Exception as e:
                     warnings.warn(f"Skipping negative '{p}': {e}")
+
+        # Load bundled SpeechCommands samples if available
+        if SPEECH_COMMANDS_SAMPLES_DIR.exists():
+            sc_paths = sorted(SPEECH_COMMANDS_SAMPLES_DIR.rglob("*.wav"))
+            random.shuffle(sc_paths)
+            for p in sc_paths:
+                try:
+                    negative_waveforms.append(load_audio(str(p)))
+                except Exception as e:
+                    warnings.warn(f"Skipping speech commands sample '{p}': {e}")
 
         for w in positive_waveforms:
             self._waveforms.append(w)
