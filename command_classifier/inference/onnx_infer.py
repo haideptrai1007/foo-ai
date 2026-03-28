@@ -15,7 +15,7 @@ import torch
 
 from command_classifier.config import CONFIDENCE_THRESHOLD
 from command_classifier.preprocessing.audio import load_audio, load_from_gradio
-from command_classifier.preprocessing.mel import full_pipeline
+from command_classifier.preprocessing.mel import create_mel_transform, waveform_to_mel
 
 
 AudioInput = Union[str, Tuple[int, np.ndarray], Any]
@@ -65,8 +65,9 @@ class ONNXInference:
 
     def predict(self, audio_input: AudioInput) -> Tuple[bool, float]:
         waveform = self._waveform_from_input(audio_input)
-        img = full_pipeline(waveform, image_size=224)  # (3,224,224), normalized for MobileNet
-        inp = img.unsqueeze(0).cpu().numpy().astype(np.float32)  # (1,3,224,224)
+        mel_transform = create_mel_transform()
+        mel_db = waveform_to_mel(waveform, mel_transform)
+        inp = mel_db.unsqueeze(0).cpu().numpy().astype(np.float32)  # (1,1,N_MELS,T)
 
         outputs = self.session.run(None, {self.input_name: inp})
         logits = outputs[0]
@@ -77,13 +78,13 @@ class ONNXInference:
         return is_command, float(prob)
 
     def predict_batch(self, audio_inputs: List[AudioInput]) -> List[Tuple[bool, float]]:
-        imgs = []
+        mel_transform = create_mel_transform()
+        mels = []
         for x in audio_inputs:
             waveform = self._waveform_from_input(x)
-            img = full_pipeline(waveform, image_size=224)
-            imgs.append(img)
+            mels.append(waveform_to_mel(waveform, mel_transform))
 
-        batch = torch.stack(imgs, dim=0).cpu().numpy().astype(np.float32)
+        batch = torch.stack(mels, dim=0).cpu().numpy().astype(np.float32)
         outputs = self.session.run(None, {self.input_name: batch})
         logits = outputs[0]
         logits_1d = np.array(logits).reshape(-1)

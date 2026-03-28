@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import copy
 import math
-import os
 import time
-import warnings
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -19,14 +15,10 @@ import torch.amp as _torch_amp
 _NEW_AMP = hasattr(_torch_amp, "GradScaler")
 
 from command_classifier.config import (
-    BATCH_SIZE,
     GRAD_CLIP_NORM,
     LR,
     NUM_EPOCHS,
-    POS_WEIGHT,
-    SCHEDULER,
     WEIGHT_DECAY,
-    UNFREEZE_LR_FACTOR,
     CONFIDENCE_THRESHOLD,
 )
 from command_classifier.model.classifier import get_param_groups, freeze_backbone, unfreeze_backbone, _unwrap
@@ -54,14 +46,6 @@ def _try_import_sklearn_metrics():
     except Exception:
         return {}
 
-
-def _try_import_plotting():
-    try:
-        import matplotlib.pyplot as plt
-
-        return {"plt": plt}
-    except Exception:
-        return {}
 
 
 class CNNTrainer:
@@ -96,16 +80,11 @@ class CNNTrainer:
         self.checkpoint_dir = checkpoint_dir or Path("./checkpoint")
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # BCEWithLogitsLoss expects pos_weight as a tensor.
         self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([float(pos_weight)], device=self.device))
 
-        # Freeze backbone initially as per plan
         freeze_backbone(self.model)
 
-        # Optimizer param groups for discriminative learning rates
-        # head_lr = LR, backbone_lr = head_lr * UNFREEZE_LR_FACTOR
-        param_groups = get_param_groups(self.model, head_lr=LR, backbone_lr_factor=UNFREEZE_LR_FACTOR)
-        # Even when frozen, AdamW param groups are fine; frozen params will have grad=None.
+        param_groups = get_param_groups(self.model, head_lr=LR, backbone_lr_factor=1.0)
         self.optimizer = torch.optim.AdamW(param_groups, lr=LR, weight_decay=WEIGHT_DECAY)
 
         # AMP
@@ -237,7 +216,7 @@ class CNNTrainer:
 
     def train(self, log_fn=None) -> Dict[str, Any]:
         """
-        Train for NUM_EPOCHS with frozen backbone first, then unfreeze and fine-tune.
+        Train for NUM_EPOCHS.
 
         log_fn: optional callable(str) called after every epoch with a status line.
         """
@@ -249,8 +228,6 @@ class CNNTrainer:
         device = self.device
         epochs = int(NUM_EPOCHS)
 
-        global_step = 0
-
         # CosineAnnealingLR: steps once per epoch — stable on tiny datasets.
         def make_scheduler(num_epochs: int) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
             if num_epochs <= 0:
@@ -261,7 +238,6 @@ class CNNTrainer:
                 eta_min=1e-6,
             )
 
-        # Phase 1: frozen backbone. Phase 2: unfrozen fine-tune (if freeze_epochs set).
         freeze_epochs = self.freeze_epochs if self.freeze_epochs is not None else epochs
         unfreeze_epoch = freeze_epochs  # epoch index at which backbone is unfrozen
 

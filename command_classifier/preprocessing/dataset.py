@@ -6,7 +6,7 @@ import random
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -14,13 +14,11 @@ from torch.utils.data import DataLoader, Dataset
 from command_classifier.config import (
     AUG_FACTOR,
     AUDIO_SAMPLES,
-    IMAGE_SIZE,
+    BATCH_SIZE,
     NEG_RATIO,
     NEG_SOURCES,
-    NUM_WORKERS,
     SPEECH_COMMANDS_SAMPLES_DIR,
-    VAL_SPLIT,
-    BATCH_SIZE,
+    SPEECH_COMMANDS_SAMPLES_PER_CLASS,
 )
 
 from command_classifier.preprocessing.audio import load_audio
@@ -30,7 +28,7 @@ from command_classifier.preprocessing.augmentation import (
     generate_traffic_noise,
     generate_horn_noise,
 )
-from command_classifier.preprocessing.mel import create_mel_transform, mel_to_image, waveform_to_mel
+from command_classifier.preprocessing.mel import create_mel_transform, waveform_to_mel
 
 
 class CommandDataset(Dataset):
@@ -80,58 +78,6 @@ class CommandDataset(Dataset):
         self._cache: List[torch.Tensor] = []
         self._build_cache()
 
-    @staticmethod
-    def _collect_paths(directory: Path, extensions: Iterable[str]) -> List[Path]:
-        exts = {e.lower().lstrip(".") for e in extensions}
-        paths: List[Path] = []
-        if not directory.exists():
-            return paths
-        for p in directory.iterdir():
-            if p.is_file() and p.suffix.lower().lstrip(".") in exts:
-                paths.append(p)
-        return sorted(paths)
-
-    def _mutate_positive_for_negative(self, waveform: torch.Tensor) -> torch.Tensor:
-        """
-        Synthesize "wrong command" negatives from positive waveform.
-        Choose one of 3 distinct mutation strategies.
-        """
-        # 3 mutation families, pick one randomly.
-        choice = random.random()
-        if choice < 0.33:
-            # Strategy 1: Time-reverse the waveform
-            out = waveform.flip(-1)
-        elif choice < 0.66:
-            # Strategy 2: Chop and shuffle segments
-            n = waveform.size(-1)
-            cut1 = int(n * random.uniform(0.2, 0.4))
-            cut2 = int(n * random.uniform(0.6, 0.8))
-            seg1 = waveform[:, :cut1]
-            seg2 = waveform[:, cut1:cut2]
-            seg3 = waveform[:, cut2:]
-            segs = [seg1, seg2, seg3]
-            random.shuffle(segs)
-            out = torch.cat(segs, dim=-1)
-        else:
-            # Strategy 3: Shuffle small windows
-            n = waveform.size(-1)
-            num_windows = random.randint(3, 6)
-            window = n // num_windows
-            chunks = []
-            for i in range(num_windows):
-                start = i * window
-                end = (i + 1) * window if i < num_windows - 1 else n
-                chunks.append(waveform[:, start:end])
-            random.shuffle(chunks)
-            out = torch.cat(chunks, dim=-1)
-
-        # Pad/truncate to fixed length
-        if out.size(-1) < AUDIO_SAMPLES:
-            out = torch.nn.functional.pad(out, (0, AUDIO_SAMPLES - out.size(-1)))
-        elif out.size(-1) > AUDIO_SAMPLES:
-            out = out[:, :AUDIO_SAMPLES]
-        return out
-
     def _generate_negative_waveforms(
         self, positive_waveforms: Sequence[torch.Tensor], target_neg_base: int, seed: int
     ) -> List[torch.Tensor]:
@@ -159,10 +105,8 @@ class CommandDataset(Dataset):
                 w = generate_traffic_noise(AUDIO_SAMPLES)
             elif src == "horn_noise":
                 w = generate_horn_noise(AUDIO_SAMPLES)
-            elif src == "random_speech":
-                w = self._mutate_positive_for_negative(base_waveform)
             else:
-                w = self._mutate_positive_for_negative(base_waveform)
+                continue
 
             negs.append(w)
         return negs
@@ -198,10 +142,11 @@ class CommandDataset(Dataset):
                 except Exception as e:
                     warnings.warn(f"Skipping negative '{p}': {e}")
 
-        # Load bundled SpeechCommands samples if available
+        # Load bundled SpeechCommands samples if available (capped per class to keep build fast)
         if SPEECH_COMMANDS_SAMPLES_DIR.exists():
             sc_paths = sorted(SPEECH_COMMANDS_SAMPLES_DIR.rglob("*.wav"))
             random.shuffle(sc_paths)
+            sc_paths = sc_paths[:SPEECH_COMMANDS_SAMPLES_PER_CLASS * 35]
             for p in sc_paths:
                 try:
                     negative_waveforms.append(load_audio(str(p)))
@@ -220,7 +165,7 @@ class CommandDataset(Dataset):
         """Pre-compute augmented mel spectrograms in parallel and cache in RAM.
 
         Audio augmentation + FFT mel conversion happen once here across a thread pool.
-        SpecAugment + mel_to_image remain on-the-fly in __getitem__ — both are fast tensor ops.
+        SpecAugment remains on-the-fly in __getitem__ — it's a fast tensor op.
         """
         augment = self.augment
         pipeline = self.pipeline
@@ -242,9 +187,8 @@ class CommandDataset(Dataset):
         mel_db = self._cache[idx]
         if self.augment:
             mel_db = self.pipeline.augment_spectrogram(mel_db)
-        img = mel_to_image(mel_db, image_size=IMAGE_SIZE)
         label = self.labels[idx // self.aug_factor]
-        return img, label
+        return mel_db, label  # (1, N_MELS, T_frames) — BCResNet-ready
 
 
 def _audio_extensions() -> Tuple[str, ...]:

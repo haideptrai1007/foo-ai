@@ -1,11 +1,28 @@
-# 1‑Class Audio Command Classifier (MobileNetV3‑Small)
+# Few-Shot Audio Command Classifier (BCResNet)
 
-Binary classifier: **"is this audio clip my target command?"** (yes/no), trained on mel‑spectrograms using a MobileNetV3‑Small backbone.
+Binary classifier: **"is this audio clip my target command?"** (yes/no), trained on log-mel spectrograms using a [BCResNet](https://github.com/Qualcomm-AI-research/bcresnet) backbone (Qualcomm, Interspeech 2021).
 
-Two stages:
+Record a few samples of your command, train, test in real-time, then export to INT8 ONNX for edge deployment.
 
-- **Stage A (optional)**: pretrain a speech‑domain backbone on `SPEECHCOMMANDS` (multiclass), save backbone‑only weights.
-- **Stage B**: few‑shot binary command detector — record samples in the UI, train, test in real-time, then export to ONNX.
+---
+
+## Architecture
+
+- **Model:** BCResNet-1 (tau=1, ~9K params) -- designed for keyword spotting on edge devices
+- **Input:** 2-second audio @ 16 kHz -> log-mel spectrogram (1, 40, 251)
+- **Output:** binary logit (command / not command)
+- **Training:** BCEWithLogitsLoss with dynamic pos_weight, CosineAnnealing LR, AMP
+- **Augmentation:** audio-domain (noise, pitch, stretch, time-shift) + SpecAugment (freq/time masking)
+
+Scale up by changing `BCRESNET_TAU` in `config.py`:
+
+| tau | base_c | Params  | Use case          |
+|-----|--------|---------|--------------------|
+| 1   | 8      | ~9K     | Edge / MCU         |
+| 2   | 16     | ~30K    | Mobile             |
+| 3   | 24     | ~60K    | Balanced           |
+| 6   | 48     | ~200K   | Server / Kaggle    |
+| 8   | 64     | ~350K   | Maximum accuracy   |
 
 ---
 
@@ -13,19 +30,30 @@ Two stages:
 
 ```
 command_classifier/
-  config.py
+  config.py             # All hyperparameters and paths
   preprocessing/
+    audio.py            # Audio loading and resampling
+    augmentation.py     # Audio + SpecAugment augmentation
+    mel.py              # Mel-spectrogram conversion
+    dataset.py          # CommandDataset + create_dataloaders()
   model/
+    bcresnet.py         # BCResNet architecture
+    subspectralnorm.py  # SubSpectralNorm module
+    classifier.py       # build_model() + utilities
   training/
+    trainer.py          # CNNTrainer (training loop)
   inference/
+    torch_infer.py      # PyTorch inference
+    onnx_infer.py       # ONNX Runtime inference
   export/
-  ui/app.py       # Gradio few-shot UI
-pretrained.py     # Stage A backbone pretrain (SPEECHCOMMANDS)
-train.py          # Stage B training (folder-based CLI)
-test.py           # Stage B inference (CLI)
-export.py         # Export checkpoint -> ONNX -> INT8 + zip bundle
-main.py           # UI entrypoint
-requirements.txt
+    quantize.py         # ONNX export + INT8 quantization
+    package.py          # Zip bundle packaging
+  ui/
+    app.py              # Gradio UI (Record -> Train -> Test -> Export)
+train.py                # CLI training
+test.py                 # CLI inference
+export.py               # CLI export
+main.py                 # UI entrypoint
 ```
 
 ---
@@ -36,97 +64,53 @@ requirements.txt
 pip install -r requirements.txt
 ```
 
----
-
-## Stage A (optional): Pretrain backbone on SPEECHCOMMANDS
-
-Pretrains a multiclass backbone on speech audio so it transfers better to your command.
-
-```bash
-python pretrained.py \
-  --out ./pretrained_backbone.pt \
-  --epochs 5 \
-  --gpus 0,1 \
-  --root ./data/speechcommands \
-  --max-train-samples 30000 \
-  --max-val-samples 5000
-```
-
-**Structured training output:**
-```
-╔════════════════════════════════════════════════════════════════╗
-║  Stage A — SPEECHCOMMANDS Backbone Pretraining                 ║
-║  Epochs: 5   Batch: 128   LR: 1e-03   Device: cuda:0          ║
-╚════════════════════════════════════════════════════════════════╝
-
-Epoch   1 / 5  [12.3s]
-  Train │ loss: 0.4321  acc: 87.65%  f1: 84.32%
-  Val   │ loss: 0.3210  acc: 90.12%  f1: 89.01%  ★ new best
-
-...
-
-══════════════════════════════════════════════════════════════════
-  Best epoch : 4
-  val_f1_macro: 92.34%
-  Saved backbone → pretrained_backbone.pt
-══════════════════════════════════════════════════════════════════
-```
-
-Saves:
-- `features_state_dict` — MobileNetV3‑Small `.features` weights
-- `pretrain_meta` — mel/audio config used during pretraining
-
-Flags:
-- `--no-data-parallel` — disable DataParallel even when multiple GPUs are visible
+Key dependencies: `torch`, `torchaudio`, `gradio`, `soundfile`, `numpy`.
 
 ---
 
-## Stage B: Few-shot training via Gradio UI
-
-### Launch
+## Quick start (Gradio UI)
 
 ```bash
-# Default (raw ImageNet MobileNetV3 backbone)
 python main.py
-
-# With Stage A pretrained backbone
-python main.py --ckpt ./pretrained_backbone.pt
-
-# Custom port / public share link
-python main.py --ckpt ./pretrained_backbone.pt --port 8080 --share
+# or with custom port / public share link
+python main.py --port 8080 --share
 ```
 
 ### UI workflow (4 tabs)
 
 | Tab | What to do |
 |-----|-----------|
-| **1 · Record** | Set samples-per-class target, record via microphone, save as Positive or Negative |
-| **2 · Train** | Set epochs, start training — live log streams as it runs, final metrics shown as JSON |
-| **3 · Test** | Record a clip, run inference — see label, probability, and inference time (ms) |
-| **4 · Export** | Export trained checkpoint to FP32 + INT8 ONNX and a deployable zip bundle |
+| **1 - Record** | Set target sample count, record clips via microphone, save as Positive |
+| **2 - Train** | Set epochs, start training -- live log streams, final metrics shown as JSON |
+| **3 - Test** | Record a clip, run inference -- see label, probability, and latency (ms) |
+| **4 - Export** | Export checkpoint to FP32 + INT8 ONNX and a deployable zip bundle |
 
-### Folder-based CLI training (alternative)
+---
+
+## CLI training
 
 ```bash
 python train.py \
   --positive-dir ./data/positive \
   --negative-dir ./data/negative \
   --checkpoint-dir ./checkpoints \
-  --gpus 0,1
+  --gpus 0
 ```
 
-### CLI inference
+---
+
+## CLI inference
 
 ```bash
 python test.py \
   --checkpoint ./checkpoints/best.pt \
   --audio ./clip.wav \
-  --threshold 0.52
+  --threshold 0.5
 ```
 
 ---
 
-## Export (CLI)
+## Export to ONNX
 
 ```bash
 python export.py \
@@ -138,12 +122,81 @@ python export.py \
 Outputs:
 - `export/model_fp32.onnx`
 - `export/model_int8.onnx`
-- `export/command_classifier_export.zip` — contains `model.onnx`, `config.json`, `inference.py`
+- `export/command_classifier_export.zip` -- contains `model.onnx`, `config.json`
 
 ---
 
-## Tips
+## Kaggle notebook usage
 
-- **Few-shot works best with real speech negatives.** Synthetic noise/silence helps, but background speech reduces false positives significantly.
-- Keep preprocessing consistent: waveform → mel → normalize → 224×224 → ImageNet normalize.
-- For best results with Stage A, use a GPU; the pretrain step is the slowest part.
+```python
+import sys, os
+# Upload the project folder or clone from git
+sys.path.insert(0, "/kaggle/working/ai")
+os.chdir("/kaggle/working/ai")
+
+from command_classifier.preprocessing.dataset import create_dataloaders
+from command_classifier.model.classifier import build_model, prepare_model
+from command_classifier.training.trainer import CNNTrainer
+from pathlib import Path
+
+# 1. Build dataloaders from your audio folders
+train_loader, _, class_weights = create_dataloaders(
+    positive_dir="/kaggle/input/your-dataset/positive",
+    negative_dir="/kaggle/input/your-dataset/negative",  # optional
+)
+
+# 2. Build model
+model = build_model(num_classes=1)
+model = prepare_model(model)
+
+# 3. Train
+trainer = CNNTrainer(
+    model=model,
+    train_loader=train_loader,
+    val_loader=None,
+    checkpoint_dir=Path("./checkpoints"),
+    freeze_epochs=0,
+    pos_weight=class_weights["pos_weight"],
+)
+result = trainer.train(log_fn=print)
+print(result)
+```
+
+---
+
+## Edge deployment
+
+The default BCResNet-1 (tau=1) has ~9K parameters and runs well on:
+- Raspberry Pi / Jetson Nano
+- Android / iOS (via ONNX Runtime Mobile)
+- Microcontrollers with >256 KB RAM (INT8 quantized)
+
+Export pipeline: PyTorch -> FP32 ONNX -> INT8 ONNX (dynamic quantization).
+
+Preprocessing on-device: 16 kHz audio -> 256-point FFT -> 40-band log-mel spectrogram. No ImageNet normalization or image resizing required.
+
+---
+
+## Config reference
+
+All hyperparameters are in [`command_classifier/config.py`](command_classifier/config.py):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `SAMPLE_RATE` | 16000 | Audio sample rate (Hz) |
+| `AUDIO_DURATION_S` | 2.0 | Clip length (seconds) |
+| `N_FFT` | 256 | FFT window size |
+| `HOP_LENGTH` | 128 | FFT hop length |
+| `N_MELS` | 40 | Mel frequency bands |
+| `BCRESNET_TAU` | 1 | Model scale (1/2/3/6/8) |
+| `AUG_FACTOR` | 5 | Virtual dataset multiplier |
+| `BATCH_SIZE` | 64 | Training batch size |
+| `NUM_EPOCHS` | 40 | Training epochs |
+| `LR` | 1e-4 | Learning rate |
+
+---
+
+## Credits
+
+- BCResNet architecture: [Qualcomm AI Research](https://github.com/Qualcomm-AI-research/bcresnet) (Interspeech 2021)
+- SubSpectralNorm: Kim et al., "Broadcasting Residual Learning for Efficient Keyword Spotting"

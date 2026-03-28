@@ -40,6 +40,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         val_loader=val_loader,
         device=None,
         checkpoint_dir=checkpoint_dir,
+        freeze_epochs=0,
         pos_weight=class_weights["pos_weight"],
     )
     result = trainer.train()

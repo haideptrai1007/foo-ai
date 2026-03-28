@@ -8,10 +8,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from command_classifier.config import CONFIDENCE_THRESHOLD, IMAGE_SIZE
+from command_classifier.config import CONFIDENCE_THRESHOLD
 from command_classifier.model.classifier import build_model, _unwrap
 from command_classifier.preprocessing.audio import load_audio, load_from_bytes, load_from_gradio
-from command_classifier.preprocessing.mel import create_mel_transform, mel_to_image, waveform_to_mel
+from command_classifier.preprocessing.mel import create_mel_transform, waveform_to_mel
 
 
 AudioInput = Union[str, Tuple[int, np.ndarray], Tuple[np.ndarray, int], bytes, Any]
@@ -67,8 +67,7 @@ class TorchInference:
         waveform = waveform.to(self.device)
 
         mel_db = waveform_to_mel(waveform, self.mel_transform)
-        img = mel_to_image(mel_db, image_size=IMAGE_SIZE)  # (3, 96, 96) - must match training
-        img = img.unsqueeze(0)  # (1, 3, 96, 96)
+        img = mel_db.unsqueeze(0)  # (1, 1, N_MELS, T_frames)
 
         logits = self.model(img).view(-1)
         prob = torch.sigmoid(logits)[0].item()

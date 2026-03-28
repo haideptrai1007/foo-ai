@@ -78,20 +78,7 @@ def _trim_silence(arr: np.ndarray, sr: int, top_db: float = 30.0) -> np.ndarray:
     return arr[start_sample:end_sample]
 
 
-def _load_backbone(model, backbone_ckpt: Optional[str]) -> None:
-    """Load Stage A backbone weights into model.features if a checkpoint is given."""
-    if not backbone_ckpt:
-        return
-    import torch
-
-    payload = torch.load(backbone_ckpt, map_location="cpu")
-    if "features_state_dict" in payload:
-        model.features.load_state_dict(payload["features_state_dict"], strict=True)
-    elif "model_state" in payload:
-        model.load_state_dict(payload["model_state"], strict=False)
-
-
-def create_app(backbone_ckpt: Optional[str] = None):
+def create_app():
     gr = _load_gradio()
 
     # Shared state: list of (sr, np.ndarray) tuples per class
@@ -147,20 +134,16 @@ def create_app(backbone_ckpt: Optional[str] = None):
             gr.Markdown("Train the few-shot classifier on your recorded samples.")
 
             with gr.Row():
-                freeze_epochs_input = gr.Number(label="Freeze backbone epochs", value=15, precision=0)
-                unfreeze_epochs_input = gr.Number(label="Unfreeze backbone epochs", value=5, precision=0)
+                total_epochs_input = gr.Number(label="Training epochs", value=40, precision=0)
                 ckpt_dir_box = gr.Textbox(label="Checkpoint output dir", value=str(CHECKPOINT_DIR))
 
-            if backbone_ckpt:
-                gr.Markdown(f"**Backbone:** `{backbone_ckpt}`")
-            else:
-                gr.Markdown("**Backbone:** ImageNet MobileNetV3 (no Stage A checkpoint)")
+            gr.Markdown("**Model:** BCResNet (trains from scratch)")
 
             train_btn = gr.Button("Start Training", variant="primary")
             train_log = gr.Textbox(label="Training log", lines=12, interactive=False)
             train_result = gr.JSON(label="Final metrics")
 
-            def on_train(state, freeze_epochs, unfreeze_epochs, ckpt_dir):
+            def on_train(state, total_epochs, ckpt_dir):
                 import torch
                 from command_classifier.config import NUM_EPOCHS
                 from command_classifier.model.classifier import build_model, prepare_model
@@ -210,15 +193,14 @@ def create_app(backbone_ckpt: Optional[str] = None):
                     ), None
                     yield emit("Building model..."), None
 
-                    model = build_model(pretrained=True, num_classes=1)
-                    _load_backbone(model, backbone_ckpt)
+                    model = build_model(num_classes=1)
                     model = prepare_model(model)
 
                     yield emit("Starting training..."), None
 
                     import command_classifier.training.trainer as _trainer_mod
                     _orig = _trainer_mod.NUM_EPOCHS
-                    _trainer_mod.NUM_EPOCHS = int(freeze_epochs) + int(unfreeze_epochs)
+                    _trainer_mod.NUM_EPOCHS = int(total_epochs)
 
                     log_q: queue.Queue = queue.Queue()
                     result_box: List[Any] = [None, None]  # [metrics, exception]
@@ -231,7 +213,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
                                 val_loader=val_loader,
                                 device=None,
                                 checkpoint_dir=Path(ckpt_dir),
-                                freeze_epochs=int(freeze_epochs),
+                                freeze_epochs=0,
                                 pos_weight=class_weights["pos_weight"],
                             )
                             result_box[0] = t.train(log_fn=log_q.put)
@@ -262,7 +244,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
 
             train_click = train_btn.click(
                 fn=on_train,
-                inputs=[clips_state, freeze_epochs_input, unfreeze_epochs_input, ckpt_dir_box],
+                inputs=[clips_state, total_epochs_input, ckpt_dir_box],
                 outputs=[train_log, train_result],
             )
 
@@ -323,7 +305,6 @@ def create_app(backbone_ckpt: Optional[str] = None):
                     F_MAX,
                     F_MIN,
                     HOP_LENGTH,
-                    IMAGE_SIZE,
                     N_FFT,
                     N_MELS,
                     SAMPLE_RATE,
@@ -350,9 +331,6 @@ def create_app(backbone_ckpt: Optional[str] = None):
                     "n_mels": N_MELS,
                     "f_min": F_MIN,
                     "f_max": F_MAX,
-                    "image_size": IMAGE_SIZE,
-                    "imagenet_mean": [0.485, 0.456, 0.406],
-                    "imagenet_std": [0.229, 0.224, 0.225],
                     "confidence_threshold": float(payload.get("metrics", {}).get("optimal_threshold", CONFIDENCE_THRESHOLD)),
                 }
                 zip_result = create_export_zip(
@@ -368,8 +346,8 @@ def create_app(backbone_ckpt: Optional[str] = None):
     return demo
 
 
-def main(backbone_ckpt: Optional[str] = None) -> None:  # pragma: no cover
-    demo = create_app(backbone_ckpt=backbone_ckpt)
+def main() -> None:  # pragma: no cover
+    demo = create_app()
     demo.launch()
 
 

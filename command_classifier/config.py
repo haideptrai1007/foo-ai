@@ -36,7 +36,6 @@ MEL_NORM: Final[str] = "slaney"
 # Augmentation
 # ----------------------------
 AUG_FACTOR: Final[int] = 5
-IMAGE_SIZE: Final[int] = 96  # input resolution for MobileNetV3 — smaller = faster on-device inference
 NOISE_SNR_RANGE: Final[Tuple[float, float]] = (5.0, 30.0)  # dB
 PITCH_SHIFT_RANGE: Final[Tuple[float, float]] = (-2.0, 2.0)  # semitones
 TIME_STRETCH_RANGE: Final[Tuple[float, float]] = (0.85, 1.15)
@@ -63,24 +62,18 @@ NEG_SOURCES: Final[Tuple[str, ...]] = (
 # ----------------------------
 NUM_CLASSES: Final[int] = 1  # single sigmoid output
 DROPOUT: Final[float] = 0.3
-FREEZE_BACKBONE_EPOCHS: Final[int] = 5
-UNFREEZE_LR_FACTOR: Final[float] = 0.1
+BCRESNET_TAU: Final[int] = 1  # BCResNet scale: 1=smallest (edge), 2/3/6/8=larger
 
 BATCH_SIZE: Final[int] = 64
 NUM_EPOCHS: Final[int] = 40
 LR: Final[float] = 1e-4
 WEIGHT_DECAY: Final[float] = 1e-4
-LABEL_SMOOTHING: Final[float] = 0.05
-POS_WEIGHT: Final[float] = 1.0
 GRAD_CLIP_NORM: Final[float] = 1.0
-EARLY_STOPPING_PATIENCE: Final[int] = 8
-SCHEDULER: Final[str] = "OneCycleLR"
 NUM_WORKERS: Final[int] = 2
 
 # ----------------------------
-# Validation
+# Inference
 # ----------------------------
-VAL_SPLIT: Final[float] = 0.15
 CONFIDENCE_THRESHOLD: Final[float] = 0.5
 
 # ----------------------------
