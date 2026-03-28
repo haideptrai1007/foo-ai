@@ -35,7 +35,7 @@ MEL_NORM: Final[str] = "slaney"
 # ----------------------------
 # Augmentation
 # ----------------------------
-AUG_FACTOR: Final[int] = 5
+AUG_FACTOR: Final[int] = 10
 IMAGE_SIZE: Final[int] = 96  # input resolution for MobileNetV3 — smaller = faster on-device inference
 NOISE_SNR_RANGE: Final[Tuple[float, float]] = (5.0, 30.0)  # dB
 PITCH_SHIFT_RANGE: Final[Tuple[float, float]] = (-2.0, 2.0)  # semitones

@@ -177,9 +177,7 @@ class CNNTrainer:
 
         return best_t
 
-    def _run_one_epoch(
-        self, train: bool, scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
-    ) -> Tuple[float, Dict[str, float]]:
+    def _run_one_epoch(self, train: bool) -> Tuple[float, Dict[str, float]]:
         self.model.train(train)
 
         total_loss = 0.0
@@ -211,9 +209,6 @@ class CNNTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                if scheduler is not None:
-                    # OneCycleLR is designed to step once per batch.
-                    scheduler.step()
 
             total_loss += float(loss.item()) * images.size(0)
             total += images.size(0)
@@ -255,23 +250,14 @@ class CNNTrainer:
 
         global_step = 0
 
-        # Scheduler setup: keep per-batch OneCycleLR.
+        # CosineAnnealingLR: steps once per epoch — stable on tiny datasets.
         def make_scheduler(num_epochs: int) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
             if num_epochs <= 0:
                 return None
-            steps_per_epoch = len(self.train_loader)
-            if steps_per_epoch == 0:
-                return None
-            # OneCycleLR in PyTorch needs max_lr list for multiple param groups; pass base max_lr.
-            max_lrs = [group["lr"] for group in self.optimizer.param_groups]
-            return torch.optim.lr_scheduler.OneCycleLR(
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                max_lr=max_lrs,
-                epochs=num_epochs,
-                steps_per_epoch=steps_per_epoch,
-                div_factor=10.0,
-                final_div_factor=10.0,
-                pct_start=0.3,
+                T_max=num_epochs,
+                eta_min=1e-6,
             )
 
         # Phase 1: frozen backbone. Phase 2: unfrozen fine-tune (if freeze_epochs set).
@@ -292,7 +278,9 @@ class CNNTrainer:
                 scheduler = make_scheduler(remaining)
 
             start = time.time()
-            train_loss, train_metrics, last_probs, last_labels = self._run_one_epoch(train=True, scheduler=scheduler)
+            train_loss, train_metrics, last_probs, last_labels = self._run_one_epoch(train=True)
+            if scheduler is not None:
+                scheduler.step()
             elapsed = time.time() - start
 
             self.history["train_loss"].append(float(train_loss))
