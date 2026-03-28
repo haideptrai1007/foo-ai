@@ -25,7 +25,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     negative_dir = Path(args.negative_dir) if args.negative_dir is not None else None
     checkpoint_dir = Path(args.checkpoint_dir)
 
-    train_loader, val_loader, _class_weights = create_dataloaders(
+    train_loader, val_loader, class_weights = create_dataloaders(
         positive_dir=str(positive_dir),
         negative_dir=str(negative_dir) if negative_dir is not None else None,
         seed=args.seed,
@@ -40,6 +40,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         val_loader=val_loader,
         device=None,
         checkpoint_dir=checkpoint_dir,
+        pos_weight=class_weights["pos_weight"],
     )
     result = trainer.train()
     print(result)

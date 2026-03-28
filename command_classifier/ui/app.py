@@ -192,7 +192,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
                     yield emit(f"Saved {len(pos_clips)} positive, {len(neg_clips)} negative clips."), None
                     yield emit("Building dataloaders..."), None
 
-                    train_loader, val_loader, _ = create_dataloaders(
+                    train_loader, val_loader, class_weights = create_dataloaders(
                         positive_dir=str(pos_dir),
                         negative_dir=str(neg_dir) if neg_dir else None,
                         seed=1234,
@@ -232,6 +232,7 @@ def create_app(backbone_ckpt: Optional[str] = None):
                                 device=None,
                                 checkpoint_dir=Path(ckpt_dir),
                                 freeze_epochs=int(freeze_epochs),
+                                pos_weight=class_weights["pos_weight"],
                             )
                             result_box[0] = t.train(log_fn=log_q.put)
                         except Exception as exc:

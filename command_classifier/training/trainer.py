@@ -81,6 +81,7 @@ class CNNTrainer:
         checkpoint_dir: Optional[Path] = None,
         initial_epoch: int = 0,
         freeze_epochs: Optional[int] = None,
+        pos_weight: float = 1.0,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -96,7 +97,7 @@ class CNNTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # BCEWithLogitsLoss expects pos_weight as a tensor.
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([float(POS_WEIGHT)], device=self.device))
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([float(pos_weight)], device=self.device))
 
         # Freeze backbone initially as per plan
         freeze_backbone(self.model)
