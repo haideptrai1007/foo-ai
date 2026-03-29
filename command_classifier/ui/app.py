@@ -168,10 +168,18 @@ def create_app():
                 interactive=False,
             )
 
+            def _counter_text(state, target):
+                n_cmds = len(state.get("commands", {}))
+                total_clips = sum(len(v) for v in state.get("commands", {}).values())
+                return f"{n_cmds} command(s), {total_clips} clip(s) recorded"
+
+            def _cmd_choices(state):
+                return gr.update(choices=list(state.get("commands", {}).keys()))
+
             def add_clip(cmd_name, audio, state, target):
                 cmd = cmd_name.strip().lower() if cmd_name else ""
                 if not cmd or audio is None:
-                    return state, _commands_table(state), _counter_text(state, target)
+                    return state, _commands_table(state), _counter_text(state, target), _cmd_choices(state)
                 sr, arr = audio
                 arr = _trim_silence(arr.copy(), sr)
                 new_state = {**state, "commands": dict(state["commands"])}
@@ -179,41 +187,64 @@ def create_app():
                 if len(clips) < int(target):
                     clips = clips + [(sr, arr)]
                 new_state["commands"][cmd] = clips
-                return new_state, _commands_table(new_state), _counter_text(new_state, target)
+                return new_state, _commands_table(new_state), _counter_text(new_state, target), _cmd_choices(new_state)
 
             def remove_command(cmd_name, state, target):
                 cmd = cmd_name.strip().lower() if cmd_name else ""
                 new_state = {**state, "commands": dict(state["commands"])}
                 new_state["commands"].pop(cmd, None)
-                return new_state, _commands_table(new_state), _counter_text(new_state, target)
+                return new_state, _commands_table(new_state), _counter_text(new_state, target), _cmd_choices(new_state)
 
             def clear_all(state, target):
                 new_state = {"commands": {}}
-                return new_state, _commands_table(new_state), _counter_text(new_state, target)
-
-            def _counter_text(state, target):
-                n_cmds = len(state.get("commands", {}))
-                total_clips = sum(len(v) for v in state.get("commands", {}).values())
-                return f"{n_cmds} command(s), {total_clips} clip(s) recorded"
+                return new_state, _commands_table(new_state), _counter_text(new_state, target), _cmd_choices(new_state)
 
             counter_display = gr.Textbox(
                 label="Status", value="0 command(s), 0 clip(s) recorded", interactive=False
             )
 
+            gr.Markdown("### Playback — hear your recordings")
+            with gr.Row():
+                preview_cmd = gr.Dropdown(
+                    label="Command", choices=[], interactive=True, scale=3,
+                )
+                preview_idx = gr.Number(
+                    label="Clip # (1-based)", value=1, precision=0, minimum=1, scale=1,
+                )
+            btn_preview = gr.Button("Play Clip")
+            preview_audio = gr.Audio(label="Playback", interactive=False)
+
+            def play_clip(state, cmd, idx):
+                clips = state.get("commands", {}).get(cmd, [])
+                if not clips:
+                    return None
+                i = max(0, min(int(idx) - 1, len(clips) - 1))
+                sr, arr = clips[i]
+                arr = arr.astype(np.float32)
+                if arr.max() > 1.0:
+                    arr = arr / 32768.0
+                return (sr, arr)
+
+            btn_preview.click(
+                fn=play_clip,
+                inputs=[clips_state, preview_cmd, preview_idx],
+                outputs=[preview_audio],
+            )
+
             btn_add.click(
                 fn=add_clip,
                 inputs=[cmd_name_box, mic_audio, clips_state, n_target],
-                outputs=[clips_state, commands_table, counter_display],
+                outputs=[clips_state, commands_table, counter_display, preview_cmd],
             )
             btn_remove.click(
                 fn=remove_command,
                 inputs=[cmd_name_box, clips_state, n_target],
-                outputs=[clips_state, commands_table, counter_display],
+                outputs=[clips_state, commands_table, counter_display, preview_cmd],
             )
             btn_clear_all.click(
                 fn=clear_all,
                 inputs=[clips_state, n_target],
-                outputs=[clips_state, commands_table, counter_display],
+                outputs=[clips_state, commands_table, counter_display, preview_cmd],
             )
 
         # ── Tab 2: Build ─────────────────────────────────────────────────
