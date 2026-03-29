@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import queue
+import json
 import tempfile
 import threading
 import time
@@ -10,15 +10,27 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import soundfile as sf
 
-from command_classifier.config import CHECKPOINT_DIR, EXPORT_DIR
+from command_classifier.config import (
+    AUDIO_DURATION_S,
+    CHECKPOINT_DIR,
+    EXPORT_DIR,
+    F_MAX,
+    F_MIN,
+    HOP_LENGTH,
+    N_FFT,
+    N_MELS,
+    SAMPLE_RATE,
+)
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _load_gradio():
     try:
         import gradio as gr
-
         return gr
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         raise ImportError("gradio is required for the UI.") from e
 
 
@@ -34,296 +46,345 @@ def _save_clips_to_dir(clips: List[Tuple[int, np.ndarray]], out_dir: Path) -> No
 
 
 def _trim_silence(arr: np.ndarray, sr: int, top_db: float = 30.0) -> np.ndarray:
-    """
-    Trim leading/trailing silence using an energy threshold.
-
-    Any frame whose RMS energy is below `top_db` dB relative to the peak
-    frame is considered silent and stripped from the edges.
-
-    Returns at least 0.1 s of audio so the clip is never empty.
-    """
-    if arr.ndim > 1:
-        mono = arr.mean(axis=-1)
-    else:
-        mono = arr
-
-    frame_len = max(1, int(sr * 0.02))  # 20 ms frames
-    # Pad so we can reshape cleanly
+    mono = arr.mean(axis=-1) if arr.ndim > 1 else arr
+    frame_len = max(1, int(sr * 0.02))
     pad = (-len(mono)) % frame_len
     padded = np.concatenate([mono, np.zeros(pad, dtype=mono.dtype)])
     frames = padded.reshape(-1, frame_len)
     rms = np.sqrt((frames.astype(np.float64) ** 2).mean(axis=1))
-
     peak_rms = rms.max()
     if peak_rms == 0:
-        return arr  # silent clip — leave unchanged
-
+        return arr
     threshold = peak_rms * (10.0 ** (-top_db / 20.0))
     active = np.where(rms >= threshold)[0]
     if len(active) == 0:
         return arr
-
-    start_sample = int(active[0]) * frame_len
-    end_sample = min(len(mono), int(active[-1] + 1) * frame_len)
-
-    # Guarantee at least 0.1 s
+    start = int(active[0]) * frame_len
+    end = min(len(mono), int(active[-1] + 1) * frame_len)
     min_len = max(1, int(sr * 0.1))
-    if end_sample - start_sample < min_len:
-        center = (start_sample + end_sample) // 2
-        start_sample = max(0, center - min_len // 2)
-        end_sample = min(len(mono), start_sample + min_len)
+    if end - start < min_len:
+        center = (start + end) // 2
+        start = max(0, center - min_len // 2)
+        end = min(len(mono), start + min_len)
+    return arr[start:end] if arr.ndim == 1 else arr[start:end]
 
-    if arr.ndim > 1:
-        return arr[start_sample:end_sample]
-    return arr[start_sample:end_sample]
 
+def _commands_table(state: Dict) -> List[List]:
+    """Render state as a list-of-rows for gr.Dataframe."""
+    rows = []
+    for cmd, clips in state.get("commands", {}).items():
+        rows.append([cmd, len(clips)])
+    return rows or [["—", 0]]
+
+
+def _similarity_table(similarities: Dict[str, float]) -> List[List]:
+    rows = sorted(similarities.items(), key=lambda x: x[1], reverse=True)
+    return [[cmd, f"{sim:.3f}"] for cmd, sim in rows]
+
+
+def _build_prototype(method: str, command_waveforms: Dict[str, Any]) -> Any:
+    """Instantiate and fit the selected prototype method."""
+    from command_classifier.prototype.logmel import LogMelPrototype
+    from command_classifier.prototype.logmel_delta import LogMelDeltaPrototype
+    from command_classifier.prototype.pretrained import PretrainedEmbeddingPrototype
+
+    if method == "logmel":
+        proto = LogMelPrototype()
+    elif method == "logmel_delta":
+        proto = LogMelDeltaPrototype()
+    elif method == "pretrained":
+        proto = PretrainedEmbeddingPrototype()
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    proto.fit(command_waveforms)
+    return proto
+
+
+def _waveforms_from_state(state: Dict) -> Dict[str, Any]:
+    """Convert recorded clips in state to waveform tensors per command."""
+    import torch
+    from command_classifier.preprocessing.audio import load_from_gradio
+
+    result: Dict[str, Any] = {}
+    for cmd, clips in state.get("commands", {}).items():
+        wavs = []
+        for clip in clips:
+            try:
+                wavs.append(load_from_gradio(clip))
+            except Exception:
+                pass
+        if wavs:
+            result[cmd] = wavs
+    return result
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 def create_app():
     gr = _load_gradio()
 
-    # Shared state: list of (sr, np.ndarray) tuples per class
-    init_state: Dict[str, List] = {"positive": [], "negative": []}
+    # State: {"commands": {"cmd_name": [(sr, np_array), ...]}}
+    clips_state = gr.State({"commands": {}})
+    # Fitted BasePrototype instance (or None)
+    proto_state = gr.State(None)
+    # Last selected method and threshold (for export)
+    method_state = gr.State("logmel_delta")
+    threshold_state = gr.State(0.75)
 
-    with gr.Blocks(title="Few-Shot Audio Command Classifier") as demo:
-        gr.Markdown("# Few-Shot Audio Command Classifier")
-        gr.Markdown("Record samples → Train → Test in real-time → Export")
+    with gr.Blocks(title="Few-Shot Multi-Command Classifier") as demo:
+        gr.Markdown("# Few-Shot Multi-Command Classifier")
+        gr.Markdown(
+            "Record 3–5 clips per command → Build prototype → "
+            "Identify commands in real time → Export"
+        )
 
-        clips_state = gr.State(value={"positive": [], "negative": []})
-
-        # ── Tab 1: Record ────────────────────────────────────────────────────
+        # ── Tab 1: Record ────────────────────────────────────────────────
         with gr.Tab("1 · Record"):
-            gr.Markdown("Record audio clips for each class. Use the microphone widget, then save.")
+            gr.Markdown(
+                "Type a command name, record a clip, then click **Add Clip**. "
+                "Repeat for every command you want to recognise."
+            )
 
             with gr.Row():
-                n_samples = gr.Number(label="Target samples per class", value=10, precision=0)
+                cmd_name_box = gr.Textbox(
+                    label="Command name",
+                    placeholder='e.g. "lights on"',
+                    scale=2,
+                )
+                n_target = gr.Number(label="Target clips / command", value=5, precision=0, scale=1)
 
             mic_audio = gr.Audio(sources=["microphone"], type="numpy", label="Microphone")
 
             with gr.Row():
-                btn_pos = gr.Button("Save as Positive", variant="primary")
-                btn_clear = gr.Button("Clear All", variant="stop")
+                btn_add = gr.Button("Add Clip", variant="primary")
+                btn_remove = gr.Button("Remove Command", variant="secondary")
+                btn_clear_all = gr.Button("Clear All", variant="stop")
 
-            counter_display = gr.Textbox(
-                label="Recorded so far",
-                value="Recorded: 0 / 10",
+            commands_table = gr.Dataframe(
+                headers=["Command", "Clips"],
+                datatype=["str", "number"],
+                label="Recorded commands",
                 interactive=False,
             )
 
-            def _counter_text(state, target):
-                return f"Recorded: {len(state['positive'])} / {int(target)}"
-
-            def save_positive(audio, state, target):
-                if audio is None:
-                    return state, _counter_text(state, target)
-                if len(state["positive"]) >= int(target):
-                    return state, _counter_text(state, target)
+            def add_clip(cmd_name, audio, state, target):
+                cmd = cmd_name.strip().lower() if cmd_name else ""
+                if not cmd or audio is None:
+                    return state, _commands_table(state), _counter_text(state, target)
                 sr, arr = audio
                 arr = _trim_silence(arr.copy(), sr)
-                state["positive"].append((sr, arr))
-                return state, _counter_text(state, target)
+                new_state = {**state, "commands": dict(state["commands"])}
+                clips = list(new_state["commands"].get(cmd, []))
+                if len(clips) < int(target):
+                    clips = clips + [(sr, arr)]
+                new_state["commands"][cmd] = clips
+                return new_state, _commands_table(new_state), _counter_text(new_state, target)
 
-            def clear_all(_state, target):
-                new_state = {"positive": [], "negative": []}
-                return new_state, _counter_text(new_state, target)
+            def remove_command(cmd_name, state, target):
+                cmd = cmd_name.strip().lower() if cmd_name else ""
+                new_state = {**state, "commands": dict(state["commands"])}
+                new_state["commands"].pop(cmd, None)
+                return new_state, _commands_table(new_state), _counter_text(new_state, target)
 
-            btn_pos.click(fn=save_positive, inputs=[mic_audio, clips_state, n_samples], outputs=[clips_state, counter_display])
-            btn_clear.click(fn=clear_all, inputs=[clips_state, n_samples], outputs=[clips_state, counter_display])
+            def clear_all(state, target):
+                new_state = {"commands": {}}
+                return new_state, _commands_table(new_state), _counter_text(new_state, target)
 
-        # ── Tab 2: Train ─────────────────────────────────────────────────────
-        with gr.Tab("2 · Train"):
-            gr.Markdown("Train the few-shot classifier on your recorded samples.")
+            def _counter_text(state, target):
+                n_cmds = len(state.get("commands", {}))
+                total_clips = sum(len(v) for v in state.get("commands", {}).values())
+                return f"{n_cmds} command(s), {total_clips} clip(s) recorded"
 
-            with gr.Row():
-                total_epochs_input = gr.Number(label="Training epochs", value=40, precision=0)
-                ckpt_dir_box = gr.Textbox(label="Checkpoint output dir", value=str(CHECKPOINT_DIR))
+            counter_display = gr.Textbox(
+                label="Status", value="0 command(s), 0 clip(s) recorded", interactive=False
+            )
 
-            gr.Markdown("**Model:** BCResNet (trains from scratch)")
+            btn_add.click(
+                fn=add_clip,
+                inputs=[cmd_name_box, mic_audio, clips_state, n_target],
+                outputs=[clips_state, commands_table, counter_display],
+            )
+            btn_remove.click(
+                fn=remove_command,
+                inputs=[cmd_name_box, clips_state, n_target],
+                outputs=[clips_state, commands_table, counter_display],
+            )
+            btn_clear_all.click(
+                fn=clear_all,
+                inputs=[clips_state, n_target],
+                outputs=[clips_state, commands_table, counter_display],
+            )
 
-            train_btn = gr.Button("Start Training", variant="primary")
-            train_log = gr.Textbox(label="Training log", lines=12, interactive=False)
-            train_result = gr.JSON(label="Final metrics")
+        # ── Tab 2: Build ─────────────────────────────────────────────────
+        with gr.Tab("2 · Build Prototypes"):
+            gr.Markdown(
+                "Choose an embedding method and build a prototype for each command. "
+                "No training loop — this completes in seconds (except pretrained on first run)."
+            )
 
-            def on_train(state, total_epochs, ckpt_dir):
-                import torch
-                from command_classifier.config import NUM_EPOCHS
-                from command_classifier.model.classifier import build_model, prepare_model
-                from command_classifier.preprocessing.dataset import create_dataloaders
-                from command_classifier.training.trainer import CNNTrainer
+            method_radio = gr.Radio(
+                choices=[
+                    ("Log-Mel  (fast, 40-dim)", "logmel"),
+                    ("Log-Mel + Delta  (robust, 120-dim)", "logmel_delta"),
+                    ("Pretrained wav2vec2  (best, 768-dim — downloads ~360 MB once)", "pretrained"),
+                ],
+                value="logmel_delta",
+                label="Embedding method",
+            )
+            threshold_slider = gr.Slider(
+                minimum=0.0, maximum=1.0, value=0.75, step=0.01,
+                label="Rejection threshold  (similarity below this → 'none')",
+            )
+            build_btn = gr.Button("Build Prototypes", variant="primary")
+            build_log = gr.Textbox(label="Log", lines=6, interactive=False)
+            build_stats = gr.JSON(label="Prototype summary")
 
-                pos_clips = state.get("positive", [])
-                neg_clips = state.get("negative", [])
+            def on_build(state, method, threshold):
+                import queue as _q
 
-                if len(pos_clips) == 0:
-                    yield "No positive samples recorded.", None
+                if not state.get("commands"):
+                    yield "No commands recorded.", None, None, threshold
                     return
 
+                log_q: "queue.Queue[Optional[str]]" = _q.Queue()
+                result: list = [None, None]
+
+                def _run():
+                    try:
+                        log_q.put(f"Converting clips to waveforms...")
+                        wavs = _waveforms_from_state(state)
+                        if not wavs:
+                            log_q.put("No valid audio found.")
+                            result[1] = "No valid audio."
+                            return
+                        log_q.put(f"Building {method} prototype for {len(wavs)} command(s)...")
+                        proto = _build_prototype(method, wavs)
+                        stats = {
+                            "method": method,
+                            "commands": {cmd: len(state["commands"][cmd]) for cmd in proto.commands},
+                            "embedding_dim": proto.embedding_dim,
+                            "threshold": threshold,
+                        }
+                        result[0] = proto
+                        result[1] = stats
+                        log_q.put(f"Done. Embedding dim: {proto.embedding_dim}")
+                        for cmd in proto.commands:
+                            log_q.put(f"  {cmd}: {len(state['commands'][cmd])} clips")
+                    except Exception as exc:
+                        log_q.put(f"Error: {exc}")
+                        result[1] = str(exc)
+                    finally:
+                        log_q.put(None)
+
                 logs = []
+                thread = threading.Thread(target=_run, daemon=True)
+                thread.start()
 
-                def emit(msg):
+                while True:
+                    msg = log_q.get()
+                    if msg is None:
+                        break
                     logs.append(msg)
-                    return "\n".join(logs)
+                    yield "\n".join(logs), None, None, threshold
 
-                yield emit("Saving clips to temp directory..."), None
+                thread.join()
 
-                with tempfile.TemporaryDirectory() as tmp:
-                    pos_dir = Path(tmp) / "positive"
-                    neg_dir = Path(tmp) / "negative" if neg_clips else None
-                    _save_clips_to_dir(pos_clips, pos_dir)
-                    if neg_clips and neg_dir is not None:
-                        _save_clips_to_dir(neg_clips, neg_dir)
+                proto_obj = result[0]
+                stats = result[1]
+                if proto_obj is None:
+                    yield "\n".join(logs), None, None, threshold
+                    return
+                yield "\n".join(logs), stats, proto_obj, threshold
 
-                    yield emit(f"Saved {len(pos_clips)} positive, {len(neg_clips)} negative clips."), None
-                    yield emit("Building dataloaders..."), None
-
-                    train_loader, val_loader, class_weights = create_dataloaders(
-                        positive_dir=str(pos_dir),
-                        negative_dir=str(neg_dir) if neg_dir else None,
-                        seed=1234,
-                    )
-
-                    n_train = len(train_loader.dataset)
-                    n_val = len(val_loader.dataset) if val_loader is not None else 0
-                    val_info = (
-                        f", {n_val} val samples | Train batches: {len(train_loader)}  Val batches: {len(val_loader)}"
-                        if val_loader is not None
-                        else " (no val split — all samples used for training)"
-                    )
-                    yield emit(
-                        f"Dataset: {n_train} train samples{val_info}"
-                    ), None
-                    yield emit("Building model..."), None
-
-                    model = build_model(num_classes=1)
-                    model = prepare_model(model)
-
-                    yield emit("Starting training..."), None
-
-                    import command_classifier.training.trainer as _trainer_mod
-                    _orig = _trainer_mod.NUM_EPOCHS
-                    _trainer_mod.NUM_EPOCHS = int(total_epochs)
-
-                    log_q: queue.Queue = queue.Queue()
-                    result_box: List[Any] = [None, None]  # [metrics, exception]
-
-                    def _run_training():
-                        try:
-                            t = CNNTrainer(
-                                model=model,
-                                train_loader=train_loader,
-                                val_loader=val_loader,
-                                device=None,
-                                checkpoint_dir=Path(ckpt_dir),
-                                freeze_epochs=0,
-                                pos_weight=class_weights["pos_weight"],
-                            )
-                            result_box[0] = t.train(log_fn=log_q.put)
-                        except Exception as exc:
-                            result_box[1] = exc
-                        finally:
-                            _trainer_mod.NUM_EPOCHS = _orig
-                            log_q.put(None)  # sentinel
-
-                    thread = threading.Thread(target=_run_training, daemon=True)
-                    thread.start()
-
-                    while True:
-                        msg = log_q.get()
-                        if msg is None:
-                            break
-                        yield emit(msg), None
-
-                    thread.join()
-
-                    if result_box[1] is not None:
-                        yield emit(f"Error: {result_box[1]}"), None
-                        return
-
-                    metrics = result_box[0]
-
-                yield emit("Training complete."), metrics
-
-            train_click = train_btn.click(
-                fn=on_train,
-                inputs=[clips_state, total_epochs_input, ckpt_dir_box],
-                outputs=[train_log, train_result],
+            build_btn.click(
+                fn=on_build,
+                inputs=[clips_state, method_radio, threshold_slider],
+                outputs=[build_log, build_stats, proto_state, threshold_state],
+            )
+            method_radio.change(
+                fn=lambda m: m,
+                inputs=[method_radio],
+                outputs=[method_state],
             )
 
-        # ── Tab 3: Test (real-time) ──────────────────────────────────────────
+        # ── Tab 3: Test ──────────────────────────────────────────────────
         with gr.Tab("3 · Test"):
-            gr.Markdown("Record a clip and run inference. Inference time and probability are shown.")
-
-            test_ckpt = gr.Textbox(label="Checkpoint (.pt) path", value=str(CHECKPOINT_DIR / "best.pt"))
-
-            train_click.then(
-                fn=lambda ckpt_dir: str(Path(ckpt_dir) / "best.pt"),
-                inputs=[ckpt_dir_box],
-                outputs=[test_ckpt],
+            gr.Markdown(
+                "Record a clip. The classifier scores it against every command prototype "
+                "and returns the best match (or 'none' if below threshold)."
             )
-            test_threshold = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.01, label="Threshold")
+
+            test_threshold = gr.Slider(
+                minimum=0.0, maximum=1.0, value=0.75, step=0.01, label="Threshold"
+            )
             test_audio = gr.Audio(sources=["microphone"], type="numpy", label="Microphone")
-            test_btn = gr.Button("Run Inference", variant="primary")
+            test_btn = gr.Button("Identify Command", variant="primary")
 
             with gr.Row():
-                test_result = gr.Textbox(label="Result", interactive=False)
-                test_prob = gr.Number(label="Probability", interactive=False)
-                test_latency = gr.Number(label="Inference time (ms)", interactive=False)
+                test_result = gr.Textbox(label="Best match", interactive=False, scale=2)
+                test_similarity = gr.Number(label="Similarity", interactive=False, scale=1)
+                test_latency = gr.Number(label="Latency (ms)", interactive=False, scale=1)
 
-            def on_test(ckpt, threshold, audio):
+            test_table = gr.Dataframe(
+                headers=["Command", "Similarity"],
+                datatype=["str", "str"],
+                label="All scores (sorted)",
+                interactive=False,
+            )
+
+            def on_test(audio, proto, threshold):
                 if audio is None:
-                    return "No audio recorded.", 0.0, 0.0
-                if not Path(ckpt).exists():
-                    return f"Checkpoint not found: {ckpt}", 0.0, 0.0
-                from command_classifier.inference.torch_infer import TorchInference
+                    return "No audio recorded.", 0.0, 0.0, []
+                if proto is None:
+                    return "Build prototypes first (Tab 2).", 0.0, 0.0, []
+                from command_classifier.preprocessing.audio import load_from_gradio
 
-                infer = TorchInference(checkpoint_path=ckpt, threshold=threshold)
+                try:
+                    waveform = load_from_gradio(audio)
+                except Exception as e:
+                    return f"Audio error: {e}", 0.0, 0.0, []
+
                 t0 = time.perf_counter()
-                is_cmd, prob = infer.predict(audio)
+                best_cmd, best_sim, all_sims = proto.predict(waveform, threshold=float(threshold))
                 latency_ms = (time.perf_counter() - t0) * 1000.0
-                label = "COMMAND DETECTED" if is_cmd else "not detected"
-                return label, round(prob, 4), round(latency_ms, 1)
+
+                label = f"COMMAND: {best_cmd}" if best_cmd != "none" else "none (below threshold)"
+                table = _similarity_table(all_sims)
+                return label, round(best_sim, 4), round(latency_ms, 1), table
 
             test_btn.click(
                 fn=on_test,
-                inputs=[test_ckpt, test_threshold, test_audio],
-                outputs=[test_result, test_prob, test_latency],
+                inputs=[test_audio, proto_state, test_threshold],
+                outputs=[test_result, test_similarity, test_latency, test_table],
             )
 
-        # ── Tab 4: Export ────────────────────────────────────────────────────
+        # ── Tab 4: Export ────────────────────────────────────────────────
         with gr.Tab("4 · Export"):
-            gr.Markdown("Export trained model to INT8 ONNX and package as a deployable zip.")
+            gr.Markdown(
+                "Export prototypes as a `.npz` bundle. "
+                "Inference on-device needs only `numpy` + the mel pipeline — no model file."
+            )
 
-            export_ckpt = gr.Textbox(label="Checkpoint (.pt) path", value=str(CHECKPOINT_DIR / "best.pt"))
-            export_zip = gr.Textbox(label="Output zip path", value=str(EXPORT_DIR / "command_classifier_export.zip"))
+            export_dir_box = gr.Textbox(
+                label="Output directory", value=str(EXPORT_DIR / "prototype")
+            )
+            export_threshold_slider = gr.Slider(
+                minimum=0.0, maximum=1.0, value=0.75, step=0.01,
+                label="Threshold to embed in config"
+            )
             export_btn = gr.Button("Export", variant="primary")
             export_result = gr.JSON(label="Export result")
 
-            def on_export(ckpt, out_zip):
-                import torch
-                from command_classifier.config import (
-                    AUDIO_DURATION_S,
-                    CONFIDENCE_THRESHOLD,
-                    F_MAX,
-                    F_MIN,
-                    HOP_LENGTH,
-                    N_FFT,
-                    N_MELS,
-                    SAMPLE_RATE,
-                )
-                from command_classifier.export.package import create_export_zip
-                from command_classifier.export.quantize import export_onnx, quantize_onnx
-                from command_classifier.model.classifier import build_model
-
-                payload = torch.load(ckpt, map_location="cpu")
-                model = build_model(pretrained=False, num_classes=1)
-                model.load_state_dict(payload["model_state"], strict=True)
-
-                EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-                fp32_path = EXPORT_DIR / "model_fp32.onnx"
-                int8_path = EXPORT_DIR / "model_int8.onnx"
-                export_onnx(model, fp32_path)
-                quantize_onnx(fp32_path, int8_path)
-
-                config = {
+            def on_export(proto, method, threshold, out_dir):
+                if proto is None:
+                    return {"error": "Build prototypes first (Tab 2)."}
+                out = Path(out_dir)
+                out.mkdir(parents=True, exist_ok=True)
+                npz_path = out / "prototypes.npz"
+                audio_config = {
                     "sample_rate": SAMPLE_RATE,
                     "audio_duration_s": AUDIO_DURATION_S,
                     "n_fft": N_FFT,
@@ -331,17 +392,27 @@ def create_app():
                     "n_mels": N_MELS,
                     "f_min": F_MIN,
                     "f_max": F_MAX,
-                    "confidence_threshold": float(payload.get("metrics", {}).get("optimal_threshold", CONFIDENCE_THRESHOLD)),
                 }
-                zip_result = create_export_zip(
-                    model_onnx_path=int8_path,
-                    config=config,
-                    export_dir=EXPORT_DIR,
-                    zip_path=Path(out_zip),
+                proto.save(
+                    npz_path=npz_path,
+                    method_name=method,
+                    threshold=float(threshold),
+                    audio_config=audio_config,
                 )
-                return {"zip": str(zip_result), "fp32_onnx": str(fp32_path), "int8_onnx": str(int8_path)}
+                return {
+                    "prototypes_npz": str(npz_path),
+                    "config_json": str(npz_path.with_suffix(".json")),
+                    "commands": proto.commands,
+                    "embedding_dim": proto.embedding_dim,
+                    "method": method,
+                    "threshold": float(threshold),
+                }
 
-            export_btn.click(fn=on_export, inputs=[export_ckpt, export_zip], outputs=[export_result])
+            export_btn.click(
+                fn=on_export,
+                inputs=[proto_state, method_state, export_threshold_slider, export_dir_box],
+                outputs=[export_result],
+            )
 
     return demo
 
