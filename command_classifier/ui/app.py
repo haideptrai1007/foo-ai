@@ -126,15 +126,13 @@ def _waveforms_from_state(state: Dict) -> Dict[str, Any]:
 def create_app():
     gr = _load_gradio()
 
-    # State: {"commands": {"cmd_name": [(sr, np_array), ...]}}
-    clips_state = gr.State({"commands": {}})
-    # Fitted BasePrototype instance (or None)
-    proto_state = gr.State(None)
-    # Last selected method and threshold (for export)
-    method_state = gr.State("logmel_delta")
-    threshold_state = gr.State(0.75)
-
     with gr.Blocks(title="Few-Shot Multi-Command Classifier") as demo:
+        # State must live inside Blocks context to avoid KeyError: 0
+        clips_state = gr.State({"commands": {}})
+        proto_state = gr.State(None)
+        method_state = gr.State("logmel_delta")
+        threshold_state = gr.State(0.75)
+
         gr.Markdown("# Few-Shot Multi-Command Classifier")
         gr.Markdown(
             "Record 3–5 clips per command → Build prototype → "
