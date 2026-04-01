@@ -12,6 +12,10 @@ from command_classifier.prototype.base import BasePrototype
 
 _BUNDLE_NAME = "WAV2VEC2_BASE"
 _EXPECTED_SR = 16000
+# Layer index to extract from wav2vec2 (0-based, 0=first transformer layer).
+# Layers 5-7 are most phoneme-discriminative; the last layer (11) encodes more
+# speaker identity which hurts short-word separation.
+_LAYER_IDX = 6
 
 
 class PretrainedEmbeddingPrototype(BasePrototype):
@@ -70,5 +74,8 @@ class PretrainedEmbeddingPrototype(BasePrototype):
         with torch.no_grad():
             # extract_features returns (list_of_layer_outputs, lengths)
             features, _ = model.extract_features(waveform)
-        # features[-1]: (1, T_frames, 768) — last transformer layer
-        return features[-1].squeeze(0).mean(0)  # (768,)
+        # features[_LAYER_IDX]: (1, T_frames, 768)
+        # Layer 6 captures phoneme boundaries better than the last layer,
+        # which tends to encode speaker identity for short clips.
+        layer = features[min(_LAYER_IDX, len(features) - 1)]
+        return layer.squeeze(0).mean(0)  # (768,)

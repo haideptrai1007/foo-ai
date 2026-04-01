@@ -73,7 +73,9 @@ def main(argv=None) -> None:
     )
     ap.add_argument(
         "--method", default="logmel_delta",
-        choices=["logmel", "logmel_delta", "pretrained"],
+        choices=["logmel", "logmel_delta", "logmel_meanstd", "nearest_neighbor",
+                 "weighted_nn", "segmented_nn", "nn_pretrained", "pretrained",
+                 "whisper_tiny", "whisper_base", "xlsr"],
         help="Embedding method (default: logmel_delta).",
     )
     ap.add_argument(
@@ -105,10 +107,38 @@ def main(argv=None) -> None:
     elif args.method == "logmel_delta":
         from command_classifier.prototype.logmel_delta import LogMelDeltaPrototype
         proto = LogMelDeltaPrototype()
-    else:
+    elif args.method == "logmel_meanstd":
+        from command_classifier.prototype.logmel_meanstd import LogMelMeanStdPrototype
+        proto = LogMelMeanStdPrototype()
+    elif args.method == "nearest_neighbor":
+        from command_classifier.prototype.nearest_neighbor import NearestNeighborPrototype
+        proto = NearestNeighborPrototype()
+    elif args.method == "weighted_nn":
+        from command_classifier.prototype.weighted_nearest_neighbor import WeightedNearestNeighborPrototype
+        proto = WeightedNearestNeighborPrototype()
+    elif args.method == "segmented_nn":
+        from command_classifier.prototype.segmented_nearest_neighbor import SegmentedNearestNeighborPrototype
+        proto = SegmentedNearestNeighborPrototype()
+    elif args.method == "nn_pretrained":
+        from command_classifier.prototype.nn_pretrained import NNPretrainedPrototype
+        print("  (loading wav2vec2 model — may download ~360 MB on first run)")
+        proto = NNPretrainedPrototype()
+    elif args.method == "pretrained":
         from command_classifier.prototype.pretrained import PretrainedEmbeddingPrototype
         print("  (loading wav2vec2 model — may download ~360 MB on first run)")
         proto = PretrainedEmbeddingPrototype()
+    elif args.method == "whisper_tiny":
+        from command_classifier.prototype.whisper_tiny import WhisperTinyPrototype
+        print("  (loading Whisper-tiny — may download ~150 MB on first run)")
+        proto = WhisperTinyPrototype()
+    elif args.method == "whisper_base":
+        from command_classifier.prototype.whisper_base import WhisperBasePrototype
+        print("  (loading Whisper-base — may download ~290 MB on first run)")
+        proto = WhisperBasePrototype()
+    else:
+        from command_classifier.prototype.xlsr import XLSRPrototype
+        print("  (loading XLS-R 300M — may download ~1.2 GB on first run)")
+        proto = XLSRPrototype()
 
     stats = proto.fit(command_waveforms)
 
@@ -138,6 +168,7 @@ def main(argv=None) -> None:
     print(f"  Commands:      {list(stats.keys())}")
     print(f"  Embedding dim: {proto.embedding_dim}")
     print(f"  Threshold:     {args.threshold}")
+    print(f"  Calib. floor:  {proto._calibration_floor:.3f}")
     print(f"\nSaved:")
     print(f"  {output_path}")
     print(f"  {output_path.with_suffix('.json')}")

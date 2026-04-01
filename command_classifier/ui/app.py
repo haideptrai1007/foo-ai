@@ -86,14 +86,38 @@ def _build_prototype(method: str, command_waveforms: Dict[str, Any]) -> Any:
     """Instantiate and fit the selected prototype method."""
     from command_classifier.prototype.logmel import LogMelPrototype
     from command_classifier.prototype.logmel_delta import LogMelDeltaPrototype
+    from command_classifier.prototype.logmel_meanstd import LogMelMeanStdPrototype
+    from command_classifier.prototype.nearest_neighbor import NearestNeighborPrototype
+    from command_classifier.prototype.nn_pretrained import NNPretrainedPrototype
     from command_classifier.prototype.pretrained import PretrainedEmbeddingPrototype
+    from command_classifier.prototype.segmented_nearest_neighbor import SegmentedNearestNeighborPrototype
+    from command_classifier.prototype.weighted_nearest_neighbor import WeightedNearestNeighborPrototype
+    from command_classifier.prototype.whisper_tiny import WhisperTinyPrototype
+    from command_classifier.prototype.whisper_base import WhisperBasePrototype
+    from command_classifier.prototype.xlsr import XLSRPrototype
 
     if method == "logmel":
         proto = LogMelPrototype()
     elif method == "logmel_delta":
         proto = LogMelDeltaPrototype()
+    elif method == "logmel_meanstd":
+        proto = LogMelMeanStdPrototype()
+    elif method == "nearest_neighbor":
+        proto = NearestNeighborPrototype()
+    elif method == "weighted_nn":
+        proto = WeightedNearestNeighborPrototype()
+    elif method == "segmented_nn":
+        proto = SegmentedNearestNeighborPrototype()
+    elif method == "nn_pretrained":
+        proto = NNPretrainedPrototype()
     elif method == "pretrained":
         proto = PretrainedEmbeddingPrototype()
+    elif method == "whisper_tiny":
+        proto = WhisperTinyPrototype()
+    elif method == "whisper_base":
+        proto = WhisperBasePrototype()
+    elif method == "xlsr":
+        proto = XLSRPrototype()
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -256,11 +280,19 @@ def create_app():
 
             method_radio = gr.Radio(
                 choices=[
-                    ("Log-Mel  (fast, 40-dim)", "logmel"),
-                    ("Log-Mel + Delta  (robust, 120-dim)", "logmel_delta"),
-                    ("Pretrained wav2vec2  (best, 768-dim — downloads ~360 MB once)", "pretrained"),
+                    ("Log-Mel mean  (40-dim, fastest)", "logmel"),
+                    ("Log-Mel mean+std  (80-dim, edge-friendly, recommended)", "logmel_meanstd"),
+                    ("Log-Mel + Δ + ΔΔ  (120-dim)", "logmel_delta"),
+                    ("Nearest-neighbor  (80-dim, best with few samples)", "nearest_neighbor"),
+                    ("Weighted NN top-k  (80-dim, stabler ranking)", "weighted_nn"),
+                    ("Segmented NN  (320-dim, time-aware)", "segmented_nn"),
+                    ("NN + wav2vec2  (768-dim, best accuracy — downloads ~360 MB)", "nn_pretrained"),
+                    ("Pretrained wav2vec2  (768-dim — downloads ~360 MB once)", "pretrained"),
+                    ("Whisper-tiny encoder  (384-dim, 99+ langs — downloads ~150 MB)", "whisper_tiny"),
+                    ("Whisper-base encoder  (512-dim, 99+ langs — downloads ~290 MB)", "whisper_base"),
+                    ("XLS-R 300M  (1024-dim, 128 langs — downloads ~1.2 GB)", "xlsr"),
                 ],
-                value="logmel_delta",
+                value="logmel_meanstd",
                 label="Embedding method",
             )
             threshold_slider = gr.Slider(
@@ -291,17 +323,38 @@ def create_app():
                             return
                         log_q.put(f"Building {method} prototype for {len(wavs)} command(s)...")
                         proto = _build_prototype(method, wavs)
+
+                        # Pairwise cosine similarity between prototypes
+                        import torch.nn.functional as _F
+                        proto_list = list(proto.prototypes.items())
+                        pairwise: Dict[str, float] = {}
+                        for i, (cmd_a, emb_a) in enumerate(proto_list):
+                            for cmd_b, emb_b in proto_list[i + 1:]:
+                                sim = float(_F.cosine_similarity(
+                                    emb_a.unsqueeze(0), emb_b.unsqueeze(0)
+                                ).item())
+                                # Rescale from [-1, 1] to [0, 1] so values are
+                                # always non-negative after speaker centering.
+                                pairwise[f"{cmd_a} ↔ {cmd_b}"] = round((sim + 1) / 2, 3)
+
                         stats = {
                             "method": method,
                             "commands": {cmd: len(state["commands"][cmd]) for cmd in proto.commands},
                             "embedding_dim": proto.embedding_dim,
                             "threshold": threshold,
+                            "calibration_floor": round(proto._calibration_floor, 3),
+                            "prototype_similarity": pairwise,
                         }
                         result[0] = proto
                         result[1] = stats
-                        log_q.put(f"Done. Embedding dim: {proto.embedding_dim}")
+                        log_q.put(f"Done. Embedding dim: {proto.embedding_dim}, calibration floor: {proto._calibration_floor:.3f}")
                         for cmd in proto.commands:
                             log_q.put(f"  {cmd}: {len(state['commands'][cmd])} clips")
+                        if pairwise:
+                            log_q.put("Prototype similarity (lower = more distinct):")
+                            for pair, sim in pairwise.items():
+                                flag = "  ⚠ too similar — consider different commands" if sim > 0.975 else ""
+                                log_q.put(f"  {pair}: {sim:.3f}{flag}")
                     except Exception as exc:
                         log_q.put(f"Error: {exc}")
                         result[1] = str(exc)
@@ -346,8 +399,25 @@ def create_app():
                 "and returns the best match (or 'none' if below threshold)."
             )
 
-            test_threshold = gr.Slider(
-                minimum=0.0, maximum=1.0, value=0.75, step=0.01, label="Threshold"
+            gr.Markdown(
+                "**Tip:** Record 3–5 clips of random words/background noise "
+                "labeled exactly **`other`** to enable explicit rejection — "
+                "anything closer to `other` than to your commands is ignored."
+            )
+            with gr.Row():
+                test_threshold = gr.Slider(
+                    minimum=-1.0, maximum=1.0, value=0.0, step=0.01,
+                    label="Similarity threshold  (reject if best score < this)",
+                    scale=1,
+                )
+                test_margin = gr.Slider(
+                    minimum=0.0, maximum=0.5, value=0.05, step=0.005,
+                    label="Margin  (reject if best − 2nd < this)",
+                    scale=1,
+                )
+            test_energy = gr.Slider(
+                minimum=0.0, maximum=0.1, value=0.01, step=0.001,
+                label="Energy gate  (reject if RMS < this — blocks silence / mic noise)",
             )
             test_audio = gr.Audio(sources=["microphone"], type="numpy", label="Microphone")
             test_btn = gr.Button("Identify Command", variant="primary")
@@ -364,11 +434,21 @@ def create_app():
                 interactive=False,
             )
 
-            def on_test(audio, proto, threshold):
+            def on_test(audio, proto, threshold, margin, energy_gate):
                 if audio is None:
                     return "No audio recorded.", 0.0, 0.0, []
                 if proto is None:
                     return "Build prototypes first (Tab 2).", 0.0, 0.0, []
+
+                # Energy gate — reject silence / background noise before prototype lookup
+                sr, arr = audio
+                arr_f = arr.astype(np.float32)
+                if arr_f.max() > 1.0:
+                    arr_f = arr_f / 32768.0
+                rms = float(np.sqrt(np.mean(arr_f ** 2)))
+                if rms < float(energy_gate):
+                    return f"none (silence — RMS {rms:.4f} below gate {energy_gate:.3f})", 0.0, 0.0, []
+
                 from command_classifier.preprocessing.audio import load_from_gradio
 
                 try:
@@ -377,16 +457,23 @@ def create_app():
                     return f"Audio error: {e}", 0.0, 0.0, []
 
                 t0 = time.perf_counter()
-                best_cmd, best_sim, all_sims = proto.predict(waveform, threshold=float(threshold))
+                best_cmd, best_sim, all_sims = proto.predict(
+                    waveform,
+                    threshold=float(threshold),
+                    margin=float(margin),
+                )
                 latency_ms = (time.perf_counter() - t0) * 1000.0
 
-                label = f"COMMAND: {best_cmd}" if best_cmd != "none" else "none (below threshold)"
+                if best_cmd == "none":
+                    label = "none (below threshold)" if best_sim < float(threshold) else "none (scores too close — unknown word?)"
+                else:
+                    label = f"COMMAND: {best_cmd}"
                 table = _similarity_table(all_sims)
                 return label, round(best_sim, 4), round(latency_ms, 1), table
 
             test_btn.click(
                 fn=on_test,
-                inputs=[test_audio, proto_state, test_threshold],
+                inputs=[test_audio, proto_state, test_threshold, test_margin, test_energy],
                 outputs=[test_result, test_similarity, test_latency, test_table],
             )
 

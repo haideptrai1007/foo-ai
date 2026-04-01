@@ -8,4 +8,4 @@ scikit-learn
 matplotlib
 seaborn
 numpy
-
+transformers
